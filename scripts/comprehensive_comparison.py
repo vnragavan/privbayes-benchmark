@@ -2,7 +2,7 @@
 """
 Comprehensive Privacy-Utility Comparison for PrivBayes Implementations
 
-This script computes ALL metrics for Enhanced, SynthCity, and DPMM PrivBayes implementations:
+Computes metrics for Enhanced, SynthCity, and DPMM PrivBayes implementations:
 - Performance: Speed, Memory, Scalability
 - Privacy: Epsilon allocation, Transparency, Privacy attacks
 - Utility: Basic + Comprehensive (TVD, EMD, MI, Downstream ML)
@@ -64,16 +64,13 @@ def _blake_bucket_eval(s: str, m: int) -> int:
 def align_real_to_enhanced_vocab(enhanced_adapter, real_df: pd.DataFrame) -> pd.DataFrame:
     """Align REAL categorical values to the Enhanced model's learned vocabulary.
     
-    DP-safe: Uses only the model's learned vocabulary (already DP-protected via DP heavy hitters).
-    This is post-processing on evaluation data, not training. The vocabulary was learned with
-    epsilon budget, and this deterministic transformation preserves DP guarantees.
+    Uses the model's DP-protected vocabulary for alignment. Post-processing
+    on evaluation data, not training, so it preserves DP guarantees.
     
-    Process:
-    - Labels: never hashed, no UNK; clamp to public classes and fill missing with first class.
-    - Non-label categoricals: if hashed, map real values -> B{bucket:03d} using each column's hash_m.
-      Clamp everything to the learned cats (else -> unknown_token).
+    Labels: never hashed, no UNK; clamp to public classes.
+    Non-label categoricals: hash if needed, then clamp to learned vocabulary.
     
-    If the adapter's internal model/meta isn't accessible, returns the REAL unchanged.
+    Returns REAL unchanged if model metadata isn't accessible.
     """
     # Try to reach the underlying synthesizer where _meta lives
     m = getattr(enhanced_adapter, "model", None) or getattr(enhanced_adapter, "_model", None) or enhanced_adapter
@@ -147,9 +144,13 @@ class ImplementationResult:
     # Privacy Attacks
     exact_row_match_rate: Optional[float] = None
     qi_linkage_rate: Optional[float] = None
+    
+    # Synthetic data path
+    synthetic_data_path: Optional[str] = None
 
 
-def run_synthcity_privbayes(real: pd.DataFrame, epsilon: float, seed: int) -> ImplementationResult:
+def run_synthcity_privbayes(real: pd.DataFrame, epsilon: float, seed: int, 
+                           n_samples: Optional[int] = None) -> ImplementationResult:
     """Run SynthCity PrivBayes implementation and measure performance.
     
     Tracks fit time, sample time, memory usage. Returns result object with
@@ -176,7 +177,8 @@ def run_synthcity_privbayes(real: pd.DataFrame, epsilon: float, seed: int) -> Im
         result.fit_time_sec = time.time() - fit_start
         
         sample_start = time.time()
-        syn = model.sample(len(real))
+        n = n_samples if n_samples is not None else len(real)
+        syn = model.sample(n)
         result.sample_time_sec = time.time() - sample_start
         
         result.total_time_sec = time.time() - start_time
@@ -202,7 +204,8 @@ def run_synthcity_privbayes(real: pd.DataFrame, epsilon: float, seed: int) -> Im
         return result, None, real
 
 
-def run_dpmm_privbayes(real: pd.DataFrame, epsilon: float, seed: int) -> ImplementationResult:
+def run_dpmm_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
+                       n_samples: Optional[int] = None) -> ImplementationResult:
     """Run DPMM PrivBayes implementation and measure performance.
     
     Discretizes data to integers before fitting (DPMM requirement). Tracks
@@ -229,7 +232,8 @@ def run_dpmm_privbayes(real: pd.DataFrame, epsilon: float, seed: int) -> Impleme
         result.fit_time_sec = time.time() - fit_start
         
         sample_start = time.time()
-        syn = model.sample(len(real))
+        n = n_samples if n_samples is not None else len(real)
+        syn = model.sample(n)
         result.sample_time_sec = time.time() - sample_start
         
         result.total_time_sec = time.time() - start_time
@@ -252,7 +256,8 @@ def run_dpmm_privbayes(real: pd.DataFrame, epsilon: float, seed: int) -> Impleme
 
 
 def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int, 
-                          temperature: float = 1.0, target_col: Optional[str] = None) -> ImplementationResult:
+                          temperature: float = 1.0, target_col: Optional[str] = None,
+                          n_samples: Optional[int] = None) -> ImplementationResult:
     """Run Enhanced PrivBayes implementation and measure performance.
     
     Auto-detects target column for label handling. Sets up public bounds
@@ -265,21 +270,34 @@ def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
         
         tracemalloc.start()
         
-        # Public bounds for better utility - also handle numeric-looking object columns
+        # Compute public bounds with margin for DP bounds discovery
+        # WARNING: Using actual min/max from data is a privacy leak if bounds aren't public knowledge.
+        # Set use_dp_bounds=True to use DP bounds discovery instead (fully DP-compliant).
+        # For now, we compute bounds from data for utility, but this should be avoided for private data.
+        use_dp_bounds = False  # Set to True for full DP compliance (uses eps_disc for bounds)
         public_bounds = {}
-        for col in real.columns:
-            # Check if numeric or can be coerced to numeric
-            if pd.api.types.is_numeric_dtype(real[col]):
-                vmin, vmax = real[col].min(), real[col].max()
-                margin = (vmax - vmin) * 0.1
-                public_bounds[col] = [vmin - margin, vmax + margin]
-            elif real[col].dtype == 'object':
-                # Try to coerce to numeric for bounds
-                s = pd.to_numeric(real[col], errors='coerce')
-                if s.notna().mean() >= 0.95:  # If 95%+ can be converted to numeric
-                    vmin, vmax = float(s.min()), float(s.max())
+        original_data_bounds = {}
+        
+        if not use_dp_bounds:
+            # Non-DP bounds discovery (privacy leak if bounds aren't public knowledge)
+            for col in real.columns:
+                if pd.api.types.is_numeric_dtype(real[col]):
+                    vmin, vmax = float(real[col].min()), float(real[col].max())
                     margin = (vmax - vmin) * 0.1
                     public_bounds[col] = [vmin - margin, vmax + margin]
+                    original_data_bounds[col] = [vmin, vmax]
+                elif real[col].dtype == 'object':
+                    s = pd.to_numeric(real[col], errors='coerce')
+                    if s.notna().mean() >= 0.95:
+                        vmin, vmax = float(s.min()), float(s.max())
+                        margin = (vmax - vmin) * 0.1
+                        public_bounds[col] = [vmin - margin, vmax + margin]
+                        original_data_bounds[col] = [vmin, vmax]
+        else:
+            # DP-compliant: Use DP bounds discovery (set public_bounds=None)
+            # The model will use eps_disc to discover bounds with DP
+            public_bounds = None
+            original_data_bounds = None
         
         # Use provided target column or auto-detect (common names: 'target', 'income', 'label', 'class')
         detected_target_col = target_col
@@ -294,9 +312,26 @@ def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
         public_categories = {}
         if detected_target_col and detected_target_col in real.columns:
             label_columns = [detected_target_col]
-            # Get unique values from real data for the label
+            # WARNING: Getting unique values from real data reveals label distribution.
+            # This is acceptable for labels if the class names are public knowledge
+            # (e.g., binary classification with known classes like '<=50K'/'>50K').
+            # For private label domains, provide public_categories explicitly.
             unique_labels = sorted(real[detected_target_col].astype(str).dropna().unique().tolist())
             public_categories[detected_target_col] = unique_labels
+        
+        # WARNING: Auto-discovering categories from training data is NOT DP-compliant.
+        # This reveals the exact set of categories in the data, which is a privacy leak.
+        # Only use this if categories are public knowledge (e.g., US states, ISO codes).
+        # For private categories, set public_categories=None and use DP heavy hitters.
+        # 
+        # Disabled by default for DP compliance. Uncomment only if categories are public.
+        # for col in real.columns:
+        #     if col in public_categories:
+        #         continue
+        #     if real[col].dtype == 'object' or real[col].dtype.name == 'category':
+        #         unique_vals = sorted(real[col].astype(str).dropna().unique().tolist())
+        #         if len(unique_vals) <= 1000:
+        #             public_categories[col] = unique_vals
         
         # Start timing from model creation onwards (excludes setup overhead)
         start_time = time.time()
@@ -305,14 +340,16 @@ def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
             delta=1.0 / (len(real) ** 2),
             seed=seed,
             temperature=temperature,
-            cpt_smoothing=1.5,  # DP-safe CPT smoothing (post-processing)
-            public_bounds=public_bounds,
+            cpt_smoothing=1.5,  # CPT smoothing (post-processing, DP-safe)
+            public_bounds=public_bounds if public_bounds else None,
             label_columns=label_columns if label_columns else None,
             public_categories=public_categories if public_categories else None,
+            cat_keep_all_nonzero=True,  # Keep all categories to avoid UNK
             bins_per_numeric=50,
             max_parents=2,
             eps_split={"structure": 0.3, "cpt": 0.7},
-            forbid_as_parent=label_columns  # Prevent label from being a parent
+            forbid_as_parent=label_columns,  # Prevent label from being a parent
+            original_data_bounds=original_data_bounds if original_data_bounds else None
         )
         
         fit_start = time.time()
@@ -320,12 +357,11 @@ def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
         result.fit_time_sec = time.time() - fit_start
         
         sample_start = time.time()
-        syn = model.sample(len(real))
+        n = n_samples if n_samples is not None else len(real)
+        syn = model.sample(n)
         result.sample_time_sec = time.time() - sample_start
         
-        # Align REAL to Enhanced vocab for fair comparison
-        # DP-safe: uses only the model's learned vocabulary (already DP-protected)
-        # This is post-processing on real data for evaluation, not training
+        # Align REAL to Enhanced vocab for fair comparison (post-processing, DP-safe)
         vocab_align_start = time.time()
         eval_real = align_real_to_enhanced_vocab(model, real)
         result.vocab_align_time_sec = time.time() - vocab_align_start
@@ -770,8 +806,9 @@ def create_utility_privacy_plots(results: List[ImplementationResult], out_dir: s
 
 # ==================== MAIN ====================
 
-def main(data_path: str, epsilons: List[float], seeds: List[int], 
-         out_dir: str, implementations: List[str], target_col: Optional[str] = None):
+def main(data_path: str, epsilons: List[float], seeds: List[int],
+         out_dir: str, implementations: List[str], target_col: Optional[str] = None,
+         n_samples: Optional[int] = None):
     """Run comprehensive benchmark comparing PrivBayes implementations.
     
     Executes all combinations of epsilon/seed/implementation. Computes utility,
@@ -787,6 +824,10 @@ def main(data_path: str, epsilons: List[float], seeds: List[int],
     print(f"Output: {out_dir}")
     if target_col:
         print(f"Target column: {target_col}")
+    if n_samples:
+        print(f"Synthetic rows: {n_samples} (custom)")
+    else:
+        print(f"Synthetic rows: same as training data (default)")
     print("="*80)
     
     # Load data
@@ -812,11 +853,11 @@ def main(data_path: str, epsilons: List[float], seeds: List[int],
                 
                 # Run implementation
                 if impl_name == "SynthCity":
-                    result, syn, eval_real = run_synthcity_privbayes(real, eps, seed)
+                    result, syn, eval_real = run_synthcity_privbayes(real, eps, seed, n_samples=n_samples)
                 elif impl_name == "DPMM":
-                    result, syn, eval_real = run_dpmm_privbayes(real, eps, seed)
+                    result, syn, eval_real = run_dpmm_privbayes(real, eps, seed, n_samples=n_samples)
                 elif impl_name == "Enhanced":
-                    result, syn, eval_real = run_enhanced_privbayes(real, eps, seed, temperature=1.0, target_col=target_col)
+                    result, syn, eval_real = run_enhanced_privbayes(real, eps, seed, temperature=1.0, target_col=target_col, n_samples=n_samples)
                 else:
                     print(f"⚠️ Unknown implementation: {impl_name}")
                     continue
@@ -860,6 +901,13 @@ def main(data_path: str, epsilons: List[float], seeds: List[int],
                 result.qi_linkage_rate = privacy_attacks['qi_linkage_rate']
                 if result.exact_row_match_rate is not None:
                     print(f"  ✓ ERMR={result.exact_row_match_rate:.4f}, QI-Link={result.qi_linkage_rate:.4f}")
+                
+                # Save synthetic dataset
+                syn_filename = f"synthetic_{impl_name}_eps{eps}_seed{seed}.csv"
+                syn_path = os.path.join(out_dir, syn_filename)
+                syn.to_csv(syn_path, index=False)
+                result.synthetic_data_path = syn_path
+                print(f"  💾 Saved synthetic data: {syn_filename} ({len(syn)} rows, {syn.shape[1]} columns)")
                 
                 all_results.append(result)
     
@@ -1065,9 +1113,11 @@ if __name__ == "__main__":
                        help="Implementations to test (Enhanced, SynthCity, DPMM)")
     parser.add_argument("--target-col", type=str, default=None,
                        help="Target column name for downstream ML metrics (auto-detected if not provided)")
+    parser.add_argument("--n-samples", type=int, default=None,
+                       help="Number of rows to generate (default: same as training data size)")
     
     args = parser.parse_args()
     
-    main(args.data, args.eps, args.seeds, args.out_dir, args.implementations, args.target_col)
+    main(args.data, args.eps, args.seeds, args.out_dir, args.implementations, args.target_col, args.n_samples)
 
 
