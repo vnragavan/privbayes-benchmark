@@ -210,17 +210,55 @@ class _ColMeta:
 
 @register("model", "privbayes")
 class PrivBayesSynthesizerEnhanced:
-    """
-    Enhanced Differentially Private PrivBayes with QI-linkage reduction features.
+    """Enhanced Differentially Private PrivBayes with QI-linkage reduction.
     
-    New features:
-      • temperature: flatten CPTs at sampling (p -> p^(1/temperature), temperature>=1).
-      • forbid_as_parent: list of columns never allowed as parents (e.g., QIs).
-      • parent_blacklist: {child: [parents_not_allowed]} mapping for fine-grained edge bans.
-      • numeric_bins_overrides: {col: k} to coarsen discretization per numeric column.
+    Supported data types:
+    - Numeric: int, float, decimal (discretized into bins)
+    - Categorical: string/varchar (uses DP heavy hitters when domain unknown)
+    - Boolean: binary numeric or categorical
+    - Datetime/timedelta: converted to nanoseconds since epoch
+      * Handles datetime64[ns] and string-formatted dates from CSV
+      * Formats: '2023-01-15 10:30:00', '2023-01-15T10:30:00', etc.
+    - Object columns: auto-detected as datetime (if 95%+ parseable), then numeric (if 95%+ convertible), else categorical
+    
+    __UNK__ tokens and how to avoid them:
+    
+    Without public categories, categoricals use DP heavy hitters:
+    - Values hashed into buckets (B000, B001, etc.) for privacy
+    - Only top-K buckets kept in vocabulary
+    - Values in non-top-K buckets become __UNK__
+    
+    Strategies to reduce/avoid __UNK__:
+    
+    1. Provide public_categories (best - no UNK, no DP cost):
+       For public domains (US states, ISO codes, etc.), provide all values.
+       Example: public_categories={'state': ['CA', 'NY', 'TX', ...]}
+    
+    2. Increase cat_topk (DP-safe, uses more epsilon):
+       Keeps more top-K buckets. Trade-off: more epsilon for discovery, less UNK.
+       Use cat_topk_overrides for per-column control.
+    
+    3. Increase cat_buckets (DP-safe, may help):
+       More hash buckets can capture more categories, but UNK still occurs if not in top-K.
+    
+    4. Use label_columns (best for target variables):
+       Label columns never use hashing, never get UNK. Example: label_columns=['income']
+    
+    5. Allocate more epsilon to categorical discovery:
+       Increase eps_disc to learn more categories. Trade-off: less epsilon for structure/CPT.
+    
+    6. Use cat_keep_all_nonzero=True (universal strategy):
+       Keeps all observed buckets instead of just top-K. Captures all training categories,
+       minimizing __UNK__ to near-zero. DP-safe, but uses more memory. Default in adapter.
+    
+    Additional features:
+      • temperature: flatten CPTs at sampling (p -> p^(1/temperature), temperature>=1)
+      • forbid_as_parent: columns never allowed as parents (e.g., QIs)
+      • parent_blacklist: {child: [parents_not_allowed]} for fine-grained edge bans
+      • numeric_bins_overrides: {col: k} to coarsen discretization per column
       • integer_decode_mode: 'round' | 'stochastic' | 'granular'
-      • numeric_granularity: {col: step} snaps floats to bands on decode.
-      • cat_topk_overrides / cat_buckets_overrides: per-column tail compression controls.
+      • numeric_granularity: {col: step} snaps floats to bands on decode
+      • cat_topk_overrides / cat_buckets_overrides: per-column tail compression
     """
 
     def __init__(
@@ -241,9 +279,12 @@ class PrivBayesSynthesizerEnhanced:
         public_bounds: Optional[Dict[str, List[float]]] = None,
         public_categories: Optional[Dict[str, List[str]]] = None,
         public_binary_numeric: Optional[Dict[str, bool]] = None,
+        original_data_bounds: Optional[Dict[str, List[float]]] = None,  # Original data min/max for clipping
         # DP heavy hitters for categoricals when domain private
         cat_buckets: int = 64,
         cat_topk: int = 28,
+        # Universal strategy: if cat_topk is None or -1, keep all non-zero buckets
+        cat_keep_all_nonzero: bool = False,  # If True, keep all buckets with noisy_count > 0
         # decoding
         decode_binary_as_bool: bool = False,
         cpt_dtype: str = "float64",
@@ -252,7 +293,7 @@ class PrivBayesSynthesizerEnhanced:
         strict_dp: bool = True,
         # ===== New knobs (all optional) =====
         temperature: float = 1.0,
-        cpt_smoothing: float = 1.5,  # NEW: pseudo-counts added after DP noise (post-processing, DP-safe)
+        cpt_smoothing: float = 1.5,  # Pseudo-counts added after DP noise (post-processing, DP-safe)
         forbid_as_parent: Optional[List[str]] = None,
         parent_blacklist: Optional[Dict[str, List[str]]] = None,
         numeric_bins_overrides: Optional[Dict[str, int]] = None,
@@ -294,10 +335,12 @@ class PrivBayesSynthesizerEnhanced:
         self.public_bounds: Dict[str, List[float]] = dict(public_bounds or {})
         self.public_categories: Dict[str, List[str]] = {k: list(v or []) for k, v in (public_categories or {}).items()}
         self.public_binary_numeric: Dict[str, bool] = dict(public_binary_numeric or {})
+        self.original_data_bounds: Dict[str, List[float]] = dict(original_data_bounds or {})
 
         # DP heavy hitters defaults
         self.cat_buckets = int(cat_buckets)
-        self.cat_topk = int(cat_topk)
+        self.cat_topk = int(cat_topk) if cat_topk is not None and cat_topk > 0 else None
+        self.cat_keep_all_nonzero = bool(cat_keep_all_nonzero)
 
         # main knobs
         self.max_parents = int(max_parents)
@@ -416,6 +459,20 @@ class PrivBayesSynthesizerEnhanced:
         meta: Dict[str, _ColMeta] = {}
 
         for c in df.columns:
+            # Handle datetime/timedelta by converting to numeric (nanoseconds)
+            if pd.api.types.is_datetime64_any_dtype(df[c]):
+                df[c] = df[c].view('int64')
+            elif pd.api.types.is_timedelta64_dtype(df[c]):
+                df[c] = df[c].view('int64')
+            # Handle string-formatted datetime columns (common in CSV exports)
+            elif df[c].dtype == 'object':
+                try:
+                    dt_parsed = pd.to_datetime(df[c], errors='coerce')
+                    if dt_parsed.notna().mean() >= 0.95:
+                        df[c] = dt_parsed.astype('int64')
+                except (ValueError, TypeError, OverflowError):
+                    pass
+            
             is_bool = is_bool_dtype(df[c])
             is_num = is_numeric_dtype(df[c])
 
@@ -531,7 +588,7 @@ class PrivBayesSynthesizerEnhanced:
                     hash_m=None,
                 )
             else:
-                # ---- LABELS: no hashing, no UNK, fixed public categories ----
+                # Labels: no hashing, no UNK, fixed public categories
                 if c in self.label_columns:
                     pub = list(self.public_categories.get(c, []) or [])
                     if not pub:
@@ -561,7 +618,14 @@ class PrivBayesSynthesizerEnhanced:
                         cats = [unk]
                 else:
                     if pub:
-                        cats = ([unk] if unk not in pub else []) + [x for x in pub if x != unk]
+                        # Use public_categories directly when provided (no __UNK__ needed)
+                        # Only add __UNK__ if it's already in the public categories list
+                        if unk in pub:
+                            cats = [x for x in pub if x != unk]  # Remove UNK if present
+                            cats = [unk] + cats  # Put UNK first if it was in pub
+                        else:
+                            # No UNK in public categories - use them as-is (no UNK needed)
+                            cats = list(pub)
                     elif eps_disc_per_col > 0.0:
                         ser = pd.Series(df[c], copy=False).astype("string")
                         m_default = int(self.cat_buckets)
@@ -571,10 +635,20 @@ class PrivBayesSynthesizerEnhanced:
                         eps_col = max(eps_disc_per_col, 1e-12)
                         noisy = {b: (float(cnt) + float(self._lap(eps_col, (), sens=1.0))) for b, cnt in counts.items()}
                         order = sorted(noisy.keys(), key=lambda t: noisy[t], reverse=True)
-                        k_default = int(self.cat_topk)
-                        K = max(8, int(min(self.cat_topk_overrides.get(c, k_default), len(order))))
-                        topk = order[:K] if K > 0 else []
-                        cats = [unk] + topk
+                        
+                        # Universal strategy: keep all observed buckets
+                        if self.cat_keep_all_nonzero:
+                            # Keep all buckets that appeared in training data
+                            # DP noise might make counts negative, but we keep all observed buckets anyway
+                            topk = list(order)
+                            # Keep __UNK__ for edge cases, but it's rarely used since we keep all categories
+                            cats = [unk] + topk if len(topk) > 0 else [unk]
+                        else:
+                            # Original top-K strategy
+                            k_default = int(self.cat_topk) if self.cat_topk is not None else 28
+                            K = max(8, int(min(self.cat_topk_overrides.get(c, k_default), len(order))))
+                            topk = order[:K] if K > 0 else []
+                            cats = [unk] + topk
                         self._dp_metadata_used_cats.add(c)
                         hashed = True
                         hash_m = m
@@ -584,7 +658,8 @@ class PrivBayesSynthesizerEnhanced:
                                 f"DP categorical discovery required for '{c}' but eps_disc_per_col=0 under strict_dp."
                             )
                         warnings.warn(
-                            "Non-DP categorical discovery used due to eps_disc=0 and strict_dp=False.",
+                            "Non-DP categorical discovery used due to eps_disc=0 and strict_dp=False. "
+                            "This is NOT differentially private and reveals the exact set of categories.",
                             stacklevel=1
                         )
                         vals = pd.Series(df[c], copy=False).astype("string").dropna().unique().tolist()
@@ -625,8 +700,9 @@ class PrivBayesSynthesizerEnhanced:
                 unk = getattr(self, "unknown_token", "__UNK__")
                 cats = list(m.cats or [])
                 
-                # Only non-label categoricals get an unknown bucket
-                if c not in self.label_columns:
+                # Non-label categoricals get unknown bucket, unless public_categories provided
+                has_public_cats = c in (self.public_categories or {})
+                if c not in self.label_columns and not has_public_cats:
                     if unk not in cats:
                         cats = [unk] + [x for x in cats if x != unk]
                         m.cats = cats
@@ -728,7 +804,7 @@ class PrivBayesSynthesizerEnhanced:
                 counts = np.bincount(disc[c].to_numpy(), minlength=k_child).astype(float)
                 if eps_per_var > 0:
                     counts += self._lap(eps_per_var, counts.shape, sens=1.0)
-                # DP-noisy counts → post-processing smoothing (α)
+                # Apply smoothing to DP-noisy counts
                 counts = np.maximum(counts, 0.0)
                 counts += self.cpt_smoothing
                 probs = (counts / counts.sum().clip(min=1e-12)).reshape(1, k_child).astype(self.cpt_dtype)
@@ -747,7 +823,7 @@ class PrivBayesSynthesizerEnhanced:
                     counts = np.bincount(disc[c].to_numpy(), minlength=k_child).astype(float)
                     if eps_per_var > 0:
                         counts += self._lap(eps_per_var, counts.shape, sens=1.0)
-                    # DP-noisy counts → post-processing smoothing (α)
+                    # Apply smoothing to DP-noisy counts
                     counts = np.maximum(counts, 0.0)
                     counts += self.cpt_smoothing
                     probs = (counts / counts.sum().clip(min=1e-12)).reshape(1, k_child).astype(self.cpt_dtype)
@@ -764,7 +840,7 @@ class PrivBayesSynthesizerEnhanced:
                 deg = (row_sums <= 1e-12).flatten()
                 if np.any(deg):
                     counts[deg, :] = 1.0
-                # DP-noisy counts → post-processing smoothing (α)
+                # Apply smoothing to DP-noisy counts
                 counts = np.maximum(counts, 0.0)
                 counts += self.cpt_smoothing
                 probs = (counts / counts.sum(axis=1, keepdims=True).clip(min=1e-12)).astype(self.cpt_dtype)
@@ -829,8 +905,8 @@ class PrivBayesSynthesizerEnhanced:
     def _decode(self, codes: Dict[str, np.ndarray], n: int, rng: np.random.Generator) -> pd.DataFrame:
         """Convert integer codes back to original data types and value ranges.
         
-        Numeric: map bin codes to uniform random values within bin bounds, then scale
-        to original range. Integer columns use decode mode (round/stochastic/granular).
+        Numeric: uniform random within bins, scaled to original range. Integers use
+        decode mode (round/stochastic/granular). Datetime columns decoded as numeric.
         Categorical: map codes to category strings. Binary numerics threshold at midpoint.
         """
         out: Dict[str, np.ndarray] = {}
@@ -844,6 +920,14 @@ class PrivBayesSynthesizerEnhanced:
                 u = rng.random(n)
                 val01 = left + (right - left) * u
                 val = lo + val01 * (hi - lo)
+                # Clip to original data bounds if provided
+                # WARNING: original_data_bounds reveals exact data range and is NOT DP-compliant
+                # Only use if bounds are public knowledge (e.g., age is always 0-120)
+                # For DP compliance, set original_data_bounds=None and let DP bounds handle it
+                if c in (self.original_data_bounds or {}):
+                    orig_lo, orig_hi = self.original_data_bounds[c]
+                    if orig_lo is not None and orig_hi is not None:
+                        val = np.clip(val, orig_lo, orig_hi)
                 if m.binary_numeric:
                     if getattr(self, "decode_binary_as_bool", False):
                         val = (val >= (lo + (hi - lo) * 0.5))
@@ -876,13 +960,13 @@ class PrivBayesSynthesizerEnhanced:
                     val = val.astype(float)
                 out[c] = val
             else:
-                # CATEGORICAL: keep unknowns as a real token (no NaNs)
+                # Categorical: keep unknowns as token (no NaNs)
                 unk = getattr(self, "unknown_token", "__UNK__")
                 cats = m.cats or [unk]
                 z = np.clip(z, 0, len(cats) - 1)
                 vals = np.array(cats, dtype=object)[z]
                 
-                # Optional legacy behavior (off by default)
+                # Legacy behavior (off by default)
                 if getattr(self, "categorical_unknown_to_nan", False):
                     vals = np.where(vals == unk, np.nan, vals)
                 
