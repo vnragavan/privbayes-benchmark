@@ -14,9 +14,10 @@ class EnhancedPrivBayesAdapter:
         delta: Optional[float] = 1e-6,
         seed: int = 42,
         temperature: float = 1.0,
-        cpt_smoothing: float = 1.5,  # NEW: DP-safe CPT smoothing (post-processing)
+        cpt_smoothing: float = 1.5,  # DP-safe CPT smoothing (post-processing)
         label_columns: Optional[list] = None,
         public_categories: Optional[dict] = None,
+        cat_keep_all_nonzero: bool = True,  # Universal strategy: keep all categories
         **kwargs
     ):
         """
@@ -62,7 +63,8 @@ class EnhancedPrivBayesAdapter:
         if label_columns:
             model_kwargs['label_columns'] = label_columns
         
-        # Initialize Enhanced PrivBayes
+        # Initialize Enhanced PrivBayes with universal strategy (keeps all categories)
+        model_kwargs['cat_keep_all_nonzero'] = cat_keep_all_nonzero
         self.model = PrivBayesSynthesizerEnhanced(
             epsilon=epsilon,
             delta=self.delta,
@@ -78,15 +80,28 @@ class EnhancedPrivBayesAdapter:
     def fit(self, X: pd.DataFrame, y=None):
         """Fit Enhanced PrivBayes model to data.
         
-        Coerces numeric-looking object columns to numeric to prevent dtype issues.
-        Delegates to underlying PrivBayesSynthesizerEnhanced model.
+        Handles datetime conversion, numeric coercion, and categorical detection.
+        Delegates to PrivBayesSynthesizerEnhanced for actual fitting.
         """
-        # Coerce numeric-looking columns to numeric to prevent dtype drift
         X2 = X.copy()
         for c in X2.columns:
-            if X2[c].dtype == 'object':
+            # Convert datetime/timedelta to nanoseconds
+            if pd.api.types.is_datetime64_any_dtype(X2[c]):
+                X2[c] = X2[c].view('int64')
+            elif pd.api.types.is_timedelta64_dtype(X2[c]):
+                X2[c] = X2[c].view('int64')
+            # Try parsing string columns as datetime (common in CSV exports)
+            elif X2[c].dtype == 'object':
+                try:
+                    dt_parsed = pd.to_datetime(X2[c], errors='coerce')
+                    if dt_parsed.notna().mean() >= 0.95:
+                        X2[c] = dt_parsed.astype('int64')
+                        continue
+                except (ValueError, TypeError, OverflowError):
+                    pass
+                # Fall back to numeric coercion
                 s = pd.to_numeric(X2[c], errors='coerce')
-                if s.notna().mean() >= 0.95:  # If 95%+ can be converted to numeric
+                if s.notna().mean() >= 0.95:
                     X2[c] = s
         
         self._real_data = X2
