@@ -90,6 +90,10 @@ python scripts/comprehensive_comparison.py \
   - Auto-detection searches for common names: `target`, `income`, `label`, `class`, `outcome`
   - Required for computing downstream ML metrics (Logistic Regression and Random Forest performance)
   - If not specified and no common name found, downstream ML metrics will be skipped
+- `--n-samples`: Number of rows to generate in synthetic data (optional, default: same as training data size)
+  - If not specified, generates the same number of rows as the training dataset
+  - Useful for generating larger or smaller synthetic datasets
+  - Example: `--n-samples 50000` to generate 50,000 rows regardless of training data size
 
 ### Example: Quick Test
 
@@ -116,6 +120,21 @@ python scripts/comprehensive_comparison.py \
     --target-col income
 ```
 
+### Example: Custom Number of Rows
+
+Generate a specific number of rows in the synthetic data:
+```bash
+python scripts/comprehensive_comparison.py \
+    --data data/adult.csv \
+    --eps 1.0 \
+    --seeds 0 \
+    --out-dir results \
+    --implementations Enhanced \
+    --n-samples 50000
+```
+
+This will generate 50,000 rows in the synthetic dataset, regardless of the training data size (which might be 30,162 rows).
+
 **Note:** The target column is automatically detected if not specified. The script searches for common column names (`target`, `income`, `label`, `class`, `outcome`) in your dataset. For the included `adult.csv` dataset, the `income` column is automatically detected.
 
 ## Output
@@ -124,11 +143,17 @@ The script generates:
 
 1. **JSON Results**: `comprehensive_results_<timestamp>.json`
    - Complete results for all experiments with all metrics
+   - Includes paths to saved synthetic datasets
 
 2. **CSV Summary**: `comprehensive_summary_<timestamp>.csv`
    - Aggregated metrics in tabular format for easy analysis
 
-3. **Visualizations**: `utility_privacy_plots.png` and `.pdf`
+3. **Synthetic Datasets**: `synthetic_<implementation>_eps<epsilon>_seed<seed>.csv`
+   - One CSV file per configuration (implementation, epsilon, seed)
+   - Contains the full synthetic dataset generated for that configuration
+   - Saved in the output directory for further analysis or reuse
+
+4. **Visualizations**: `utility_privacy_plots.png` and `.pdf`
    - 9-panel plot showing:
      - Utility vs Privacy Budget
      - Privacy Budget Efficiency
