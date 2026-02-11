@@ -36,7 +36,8 @@ This repository provides a clean, focused comparison framework for three PrivBay
 ```
 privbayes-benchmark/
 ├── data/
-│   └── adult.csv              # Adult dataset for benchmarking
+│   ├── adult.csv              # Adult dataset for benchmarking
+│   └── breast_cancer.csv      # (Optional) generated medical dataset for testing
 ├── external/
 │   └── privbayes_enhanced.py  # Enhanced PrivBayes implementation
 ├── src/
@@ -47,7 +48,12 @@ privbayes-benchmark/
 │           ├── pb_synthcity.py       # SynthCity PrivBayes adapter
 │           └── pb_datasynthesizer.py # DPMM PrivBayes adapter
 ├── scripts/
-│   └── comprehensive_comparison.py  # Main comparison script
+│   ├── comprehensive_comparison.py        # Run benchmark + write JSON/CSV (+ default plots)
+│   ├── plot_utility_privacy_from_json.py   # One-stop plotting from comprehensive_results_*.json
+│   ├── validate_metrics_json.py            # Sanity-check metrics JSON structure/ranges
+│   ├── verify_install.py                   # Verify environment + imports + datasets
+│   ├── prepare_breast_cancer_dataset.py    # Generate data/breast_cancer.csv from sklearn
+│   └── augment_results_json_with_downstream.py  # (Optional) recompute/inject downstream metrics into an existing JSON
 ├── requirements.txt
 └── README.md
 ```
