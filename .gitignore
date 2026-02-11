@@ -1,0 +1,13 @@
+.venv/
+
+# Python caches
+**/__pycache__/
+**/*.pyc
+
+# Local benchmark outputs / artifacts (large)
+medical_*/
+quick_test*/
+results*/
+
+# Common generated artifacts
+*.log

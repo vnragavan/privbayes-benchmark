@@ -444,8 +444,12 @@ def compute_basic_utility(real: pd.DataFrame, syn: pd.DataFrame) -> Dict[str, fl
     return metrics
 
 
-def compute_comprehensive_utility(real: pd.DataFrame, syn: pd.DataFrame, 
-                                  target_col: Optional[str] = 'target') -> Dict[str, Any]:
+def compute_comprehensive_utility(
+    real: pd.DataFrame,
+    syn: pd.DataFrame,
+    target_col: Optional[str] = "target",
+    n_bootstrap: int = 30,
+) -> Dict[str, Any]:
     """Compute comprehensive utility metrics: TVD, MI, correlation, coverage, downstream ML.
     
     Includes bootstrap confidence intervals for robustness. Metrics computed
@@ -455,10 +459,10 @@ def compute_comprehensive_utility(real: pd.DataFrame, syn: pd.DataFrame,
     
     print("    Computing TVD metrics...", flush=True)
     try:
-        metrics['tvd'] = comprehensive_tvd_metrics(real, syn, n_bootstrap=30)
+        metrics["tvd"] = comprehensive_tvd_metrics(real, syn, n_bootstrap=n_bootstrap)
         # Print TVD/EMD method counts
-        if 'summary' in metrics['tvd']:
-            tvd_sum = metrics['tvd']['summary']
+        if "summary" in metrics["tvd"]:
+            tvd_sum = metrics["tvd"]["summary"]
             emd_count = tvd_sum.get('_tvd1_emd_count', 0)
             tvd_count = tvd_sum.get('_tvd1_tvd_count', 0)
             tvd_fallback = tvd_sum.get('_tvd1_tvd_fallback_count', 0)
@@ -468,36 +472,38 @@ def compute_comprehensive_utility(real: pd.DataFrame, syn: pd.DataFrame,
                 print(f"         TVD 1D methods: {emd_count} EMD, {tvd_count} TVD, {tvd_fallback} TVD(fallback)", file=sys.stderr, flush=True)
     except Exception as e:
         print(f"    ⚠️ TVD failed: {e}")
-        metrics['tvd'] = {}
+        metrics["tvd"] = {}
     
-    print("    Computing MI metrics...")
+    print("    Computing MI metrics...", flush=True)
     try:
-        metrics['mi'] = comprehensive_mi_metrics(real, syn, n_bootstrap=30)
+        metrics["mi"] = comprehensive_mi_metrics(real, syn, n_bootstrap=n_bootstrap)
     except Exception as e:
         print(f"    ⚠️ MI failed: {e}")
-        metrics['mi'] = {}
+        metrics["mi"] = {}
     
     print("    Computing correlation metrics...", flush=True)
     try:
-        metrics['correlation'] = comprehensive_correlation_metrics(real, syn, n_bootstrap=30)
+        metrics["correlation"] = comprehensive_correlation_metrics(real, syn, n_bootstrap=n_bootstrap)
     except Exception as e:
         print(f"    ⚠️ Correlation failed: {e}")
-        metrics['correlation'] = {}
+        metrics["correlation"] = {}
     
-    print("    Computing coverage metrics...")
+    print("    Computing coverage metrics...", flush=True)
     try:
-        metrics['coverage'] = comprehensive_coverage_metrics(real, syn, n_bootstrap=30)
+        metrics["coverage"] = comprehensive_coverage_metrics(real, syn, n_bootstrap=n_bootstrap)
     except Exception as e:
         print(f"    ⚠️ Coverage failed: {e}")
-        metrics['coverage'] = {}
+        metrics["coverage"] = {}
     
     if target_col and target_col in real.columns:
-        print("    Computing downstream ML metrics...")
+        print("    Computing downstream ML metrics...", flush=True)
         try:
-            metrics['downstream'] = comprehensive_downstream_metrics(real, syn, target_col=target_col, n_bootstrap=30)
+            metrics["downstream"] = comprehensive_downstream_metrics(
+                real, syn, target_col=target_col, n_bootstrap=n_bootstrap
+            )
         except Exception as e:
             print(f"    ⚠️ Downstream failed: {e}")
-            metrics['downstream'] = {}
+            metrics["downstream"] = {}
     
     return metrics
 
@@ -550,7 +556,7 @@ def compute_privacy_attacks(real: pd.DataFrame, syn: pd.DataFrame) -> Dict[str, 
 
 # ==================== VISUALIZATION ====================
 
-def create_utility_privacy_plots(results: List[ImplementationResult], out_dir: str):
+def create_utility_privacy_plots(results: List[ImplementationResult], out_dir: str, filename_prefix: str = "utility_privacy_plots"):
     """Generate 9-panel visualization comparing implementations across metrics.
     
     Plots utility vs privacy budget, efficiency, privacy risk, performance,
@@ -691,18 +697,42 @@ def create_utility_privacy_plots(results: List[ImplementationResult], out_dir: s
     ax.legend()
     ax.grid(True, alpha=0.3)
     
-    # Plot 3: Privacy Risk (ERMR) vs Epsilon
+    # Plot 3: Privacy Risk (QI linkage) vs Epsilon
     ax = axes[0, 2]
+    # If ERMR is constant (often 0.0), don't clutter the panel; annotate instead.
+    ermr_note = None
+    if 'ermr' in df_agg.columns and df_agg['ermr'].notna().any():
+        ermr_vals = df_agg['ermr'].dropna().astype(float)
+        if len(ermr_vals) > 0 and (ermr_vals.max() - ermr_vals.min()) < 1e-12:
+            ermr_note = float(ermr_vals.iloc[0])
+
     for impl in impls:
         data_impl = df_agg[df_agg['implementation'] == impl]
-        if 'ermr' in data_impl.columns and data_impl['ermr'].notna().any():
-            ax.plot(data_impl['epsilon'], data_impl['ermr'], 
-                    marker='^', label=impl, color=colors.get(impl), linewidth=2)
+        if 'qi_linkage' in data_impl.columns and data_impl['qi_linkage'].notna().any():
+            ax.plot(
+                data_impl['epsilon'],
+                data_impl['qi_linkage'],
+                marker='o',
+                label=f"{impl}",
+                color=colors.get(impl),
+                linewidth=2,
+            )
     ax.set_xlabel('Privacy Budget (ε)', fontsize=12)
-    ax.set_ylabel('Exact Row Match Rate', fontsize=12)
-    ax.set_title('Privacy Risk vs Budget', fontweight='bold')
-    ax.legend()
+    ax.set_ylabel('Rate (lower is better)', fontsize=12)
+    ax.set_title('QI Linkage Rate vs Budget', fontweight='bold')
+    ax.set_ylim(0, 1)
+    ax.legend(fontsize=9, ncol=1)
     ax.grid(True, alpha=0.3)
+    if ermr_note is not None:
+        ax.text(
+            0.02,
+            0.02,
+            f"Note: ERMR is constant at {ermr_note:.4f} for all mechanisms",
+            transform=ax.transAxes,
+            fontsize=9,
+            ha="left",
+            va="bottom",
+        )
     
     # Plot 4: Performance (Time) vs Epsilon
     ax = axes[1, 0]
@@ -759,9 +789,15 @@ def create_utility_privacy_plots(results: List[ImplementationResult], out_dir: s
             if 'tvd_2d_mean' in data_impl.columns and data_impl['tvd_2d_mean'].notna().any():
                 ax.plot(data_impl['epsilon'], data_impl['tvd_2d_mean'], 
                         marker='s', label=f'{impl} (2D)', color=colors.get(impl), linewidth=1.5, linestyle='--')
+            if 'tvd_3d_mean' in data_impl.columns and data_impl['tvd_3d_mean'].notna().any():
+                ax.plot(data_impl['epsilon'], data_impl['tvd_3d_mean'],
+                        marker='^', label=f'{impl} (3D)', color=colors.get(impl), linewidth=1.5, linestyle=':')
     ax.set_xlabel('Privacy Budget (ε)', fontsize=12)
-    ax.set_ylabel('Total Variation Distance', fontsize=12)
-    ax.set_title('TVD Metrics (Lower is Better)', fontweight='bold')
+    ax.set_ylabel('Distance (log scale)', fontsize=12)
+    ax.set_title('TVD/EMD Metrics (Lower is Better)', fontweight='bold')
+    # tvd_1d_mean can be EMD(IQR-normalized) for numeric columns, and can be orders of magnitude
+    # larger than 2D/3D TVD; use log scale so all implementations remain visible.
+    ax.set_yscale('log')
     ax.legend(fontsize=8, ncol=2)
     ax.grid(True, alpha=0.3)
     
@@ -783,14 +819,23 @@ def create_utility_privacy_plots(results: List[ImplementationResult], out_dir: s
     
     # Plot 9: Downstream ML Performance (LR AUC, RF AUC) - higher is better
     ax = axes[2, 2]
+    # If LR and RF overlap (common when a method collapses labels), apply a small x-offset
+    # so both markers are visible.
+    try:
+        eps_span = float(df_agg['epsilon'].max() - df_agg['epsilon'].min())
+    except Exception:
+        eps_span = 0.0
+    dx = 0.01 * (eps_span if eps_span > 0 else 1.0)
     for impl in impls:
         data_impl = df_agg[df_agg['implementation'] == impl]
         if 'syn2real_lr_auc' in data_impl.columns and data_impl['syn2real_lr_auc'].notna().any():
-            ax.plot(data_impl['epsilon'], data_impl['syn2real_lr_auc'], 
-                    marker='o', label=f'{impl} (LR)', color=colors.get(impl), linewidth=1.5, linestyle='-')
+            ax.plot(data_impl['epsilon'] - dx, data_impl['syn2real_lr_auc'], 
+                    marker='o', label=f'{impl} (LR)', color=colors.get(impl), linewidth=1.5, linestyle='-',
+                    markerfacecolor='none', markeredgewidth=1.8)
         if 'syn2real_rf_auc' in data_impl.columns and data_impl['syn2real_rf_auc'].notna().any():
-            ax.plot(data_impl['epsilon'], data_impl['syn2real_rf_auc'], 
-                    marker='s', label=f'{impl} (RF)', color=colors.get(impl), linewidth=1.5, linestyle='--')
+            ax.plot(data_impl['epsilon'] + dx, data_impl['syn2real_rf_auc'], 
+                    marker='s', label=f'{impl} (RF)', color=colors.get(impl), linewidth=1.5, linestyle='--',
+                    markerfacecolor='none', markeredgewidth=1.8)
     ax.set_xlabel('Privacy Budget (ε)', fontsize=12)
     ax.set_ylabel('ML Model AUC (Syn→Real)', fontsize=12)
     ax.set_title('Downstream ML Performance', fontweight='bold')
@@ -798,9 +843,9 @@ def create_utility_privacy_plots(results: List[ImplementationResult], out_dir: s
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig(f"{out_dir}/utility_privacy_plots.png", dpi=300, bbox_inches='tight')
-    plt.savefig(f"{out_dir}/utility_privacy_plots.pdf", bbox_inches='tight')
-    print(f"✅ Saved plots to {out_dir}/utility_privacy_plots.png")
+    plt.savefig(f"{out_dir}/{filename_prefix}.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{out_dir}/{filename_prefix}.pdf", bbox_inches='tight')
+    print(f"✅ Saved plots to {out_dir}/{filename_prefix}.png")
     plt.close()
 
 
@@ -808,7 +853,8 @@ def create_utility_privacy_plots(results: List[ImplementationResult], out_dir: s
 
 def main(data_path: str, epsilons: List[float], seeds: List[int],
          out_dir: str, implementations: List[str], target_col: Optional[str] = None,
-         n_samples: Optional[int] = None):
+         n_samples: Optional[int] = None,
+         n_bootstrap: int = 30):
     """Run comprehensive benchmark comparing PrivBayes implementations.
     
     Executes all combinations of epsilon/seed/implementation. Computes utility,
@@ -822,6 +868,7 @@ def main(data_path: str, epsilons: List[float], seeds: List[int],
     print(f"Seeds: {seeds}")
     print(f"Implementations: {implementations}")
     print(f"Output: {out_dir}")
+    print(f"Bootstrap resamples (for CI): {n_bootstrap}")
     if target_col:
         print(f"Target column: {target_col}")
     if n_samples:
@@ -888,7 +935,9 @@ def main(data_path: str, epsilons: List[float], seeds: List[int],
                         if col in eval_real.columns:
                             detected_target_col = col
                             break
-                comp_util = compute_comprehensive_utility(eval_real, syn, target_col=detected_target_col)
+                comp_util = compute_comprehensive_utility(
+                    eval_real, syn, target_col=detected_target_col, n_bootstrap=n_bootstrap
+                )
                 result.tvd_metrics = comp_util.get('tvd', {})
                 result.mi_metrics = comp_util.get('mi', {})
                 result.correlation_metrics = comp_util.get('correlation', {})
@@ -1115,9 +1164,24 @@ if __name__ == "__main__":
                        help="Target column name for downstream ML metrics (auto-detected if not provided)")
     parser.add_argument("--n-samples", type=int, default=None,
                        help="Number of rows to generate (default: same as training data size)")
+    parser.add_argument(
+        "--n-bootstrap",
+        type=int,
+        default=30,
+        help="Number of bootstrap resamples for confidence intervals (0 disables).",
+    )
     
     args = parser.parse_args()
     
-    main(args.data, args.eps, args.seeds, args.out_dir, args.implementations, args.target_col, args.n_samples)
+    main(
+        args.data,
+        args.eps,
+        args.seeds,
+        args.out_dir,
+        args.implementations,
+        args.target_col,
+        args.n_samples,
+        args.n_bootstrap,
+    )
 
 

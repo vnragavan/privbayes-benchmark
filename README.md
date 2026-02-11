@@ -76,7 +76,60 @@ python scripts/verify_install.py
 - The `pbbench` package uses a `src/` layout and is not installed as a wheel; scripts in this repo (including `verify_install.py`) add `src/` to `sys.path`.
 - `dpmm` may not be available on Python 3.12 via PyPI (it declares `Requires-Python <3.12`). If you need the DPMM variant, use Python 3.11, or install it separately with `--ignore-requires-python` at your own risk.
 
+### Dependency / platform notes (important)
+
+- **Python 3.12 compatibility**: Some packages historically lag Python 3.12 wheels. If `pip install -r requirements.txt` fails on your machine, try **Python 3.11** first.
+- **DPMM (`dpmm`) on Python 3.12**: PyPI metadata may block install (`Requires-Python <3.12`). Recommended: use **Python 3.11** if you want DPMM without workarounds.
+- **SynthCity + PyTorch version constraints**: SynthCity may declare conservative torch constraints in its metadata. On some setups you may hit a runtime error like `torch.nn` missing `RMSNorm` (sometimes mis-remembered as an “RMSProp issue”). If that happens, upgrade PyTorch and reinstall SynthCity without deps (advanced users; see Linux notes below).
+- **Optional SynthCity warnings**: You may see warnings like `No module named 'dgl'` from optional plugins. This does **not** affect PrivBayes runs (the PrivBayes plugin still works); it just disables those optional modules.
+
+### Linux install recommendations
+
+For Linux (especially if you want **DPMM**), we recommend **Python 3.11**.
+
+**CPU-only Linux (simplest):**
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+python -m pip install -r requirements.txt
+python scripts/verify_install.py
+```
+
+**CUDA Linux (recommended if you have an NVIDIA GPU):**
+
+Install PyTorch first using the official PyTorch command for your CUDA version, then install the rest:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
+
+# 1) Install torch/torchvision using the official PyTorch instructions for your CUDA version.
+# 2) Then:
+python -m pip install -r requirements.txt
+python scripts/verify_install.py
+```
+
+**If SynthCity fails at runtime with an RMSNorm error**
+
+If you see an error like:
+- `AttributeError: module 'torch.nn' has no attribute 'RMSNorm'`
+
+Use this workaround:
+
+```bash
+python -m pip install -U "torch>=2.4,<2.5" "torchvision>=0.19,<0.20"
+python -m pip install --no-deps "synthcity==0.2.12"
+```
+
 ## Usage
+
+First, activate your virtual environment:
+```bash
+source .venv/bin/activate
+```
 
 ### Basic Usage
 
@@ -89,6 +142,40 @@ python scripts/comprehensive_comparison.py \
     --out-dir results \
     --implementations Enhanced SynthCity DPMM
 ```
+
+### Recommended: Multi-ε trends with uncertainty (multiple seeds)
+
+If you want to interpret trends across ε reliably, run **multiple seeds** per ε and plot mean + error bars.
+
+**Run the benchmark (example: 5 ε values, 5 seeds):**
+
+```bash
+python scripts/comprehensive_comparison.py \
+  --data data/breast_cancer.csv \
+  --eps 0.1 0.5 1.0 3.0 5.0 \
+  --seeds 0 1 2 3 4 \
+  --out-dir medical_breast_cancer_trend_eps_seeds5 \
+  --implementations Enhanced SynthCity DPMM \
+  --target-col target \
+  --n-bootstrap 0
+```
+
+Notes:
+- `--n-bootstrap 0` disables internal bootstrap confidence intervals for speed. For trend plots, the most meaningful uncertainty typically comes from **run-to-run variation across seeds**.
+- SynthCity can use very large peak memory on some datasets.
+
+**Plot from the saved JSON (mean + uncertainty across seeds):**
+
+```bash
+python scripts/plot_utility_privacy_from_json.py medical_breast_cancer_trend_eps_seeds5 \
+  --prefix trend_eps_seeds5 \
+  --uncertainty ci95
+```
+
+This will write:
+- `trend_eps_seeds5.png` and `trend_eps_seeds5.pdf` (9-panel utility/privacy)
+- `trend_eps_seeds5_performance.png` and `trend_eps_seeds5_performance.pdf` (4-panel performance)
+into the output directory (`medical_breast_cancer_trend_eps_seeds5/`).
 
 ### Command Line Arguments
 
@@ -105,6 +192,8 @@ python scripts/comprehensive_comparison.py \
   - If not specified, generates the same number of rows as the training dataset
   - Useful for generating larger or smaller synthetic datasets
   - Example: `--n-samples 50000` to generate 50,000 rows regardless of training data size
+- `--n-bootstrap`: Number of bootstrap resamples used when computing confidence intervals inside the comprehensive metrics (default: 30)
+  - Set `--n-bootstrap 0` to disable CI computation for speed (recommended when you are running many seeds and will estimate uncertainty across seeds instead).
 
 ### Example: Quick Test
 
@@ -175,6 +264,25 @@ The script generates:
      - TVD Metrics
      - Correlation Metrics
      - Downstream ML Performance
+
+## Plotting from JSON (no rerun required)
+
+Use `scripts/plot_utility_privacy_from_json.py` to regenerate plots directly from any `comprehensive_results_*.json` (or a directory containing it).
+
+Examples:
+
+```bash
+# Plot from the newest JSON in a directory
+python scripts/plot_utility_privacy_from_json.py results_dir --prefix my_plots
+
+# Plot with uncertainty across seeds (requires multiple seeds in the JSON)
+python scripts/plot_utility_privacy_from_json.py results_dir --prefix my_plots_ci95 --uncertainty ci95
+```
+
+Uncertainty modes:
+- `--uncertainty none`: no error bars
+- `--uncertainty se`: mean ± standard error across seeds/runs
+- `--uncertainty ci95`: mean ± 1.96·SE across seeds/runs (normal approximation)
 
 ## Dataset Format
 

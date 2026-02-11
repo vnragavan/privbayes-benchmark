@@ -2126,6 +2126,37 @@ def _evaluate_direction(
         results['random_forest'] = rfr_out
         return results
     
+    # If training labels are degenerate (single class), sklearn classifiers cannot fit.
+    # Return a deterministic "most frequent" baseline so downstream metrics are always defined
+    # and comparable across mechanisms (collapsed labels -> near-chance AUC).
+    y_tr = pd.Series(y_train).dropna()
+    uniq_tr = pd.unique(y_tr)
+    if uniq_tr.size < 2:
+        only = uniq_tr[0] if uniq_tr.size == 1 else None
+        y_t = pd.Series(y_test).to_numpy()
+        # Keep dtype consistent with y_test to avoid sklearn "unknown" target type.
+        try:
+            pred = np.full(y_t.shape, fill_value=only, dtype=y_t.dtype)
+        except Exception:
+            pred = np.full(y_t.shape, fill_value=only, dtype=object)
+        acc = float((pred == y_t).mean()) if y_t.size else np.nan
+        f1 = float(f1_score(y_t, pred, average='weighted', zero_division=0)) if y_t.size else np.nan
+        # AUC is undefined when y_test has < 2 classes; otherwise constant predictor => 0.5
+        auc = 0.5 if pd.Series(y_t).nunique(dropna=True) >= 2 else np.nan
+        note = f"train_y_single_class={only!r}; used constant-predictor baseline"
+        block = {
+            'accuracy': _round_metric(acc),
+            'f1_score': _round_metric(f1),
+            'log_loss': None,
+            'roc_auc': _round_metric(auc) if np.isfinite(auc) else np.nan,
+            'dropped_test_rows': 0,
+            'kept_classes': [only] if only is not None else [],
+            'note': note,
+        }
+        results['logistic_regression'] = dict(block)
+        results['random_forest'] = dict(block)
+        return results
+
     # Logistic Regression with StandardScaler for stability
     lr = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
@@ -2219,6 +2250,13 @@ def _cross_validate_models(
     
     # Guard against tiny classes - check if any class has < 2 samples
     vc = pd.Series(y).value_counts()
+    # Also guard against degenerate labels (only one class present)
+    if vc.size < 2:
+        return {
+            'logistic_regression': {'accuracy_mean': np.nan, 'accuracy_std': np.nan, 'f1_mean': np.nan, 'f1_std': np.nan, 'cv_scores': []},
+            'random_forest': {'accuracy_mean': np.nan, 'accuracy_std': np.nan, 'f1_mean': np.nan, 'f1_std': np.nan, 'cv_scores': []},
+            'meta': {'n_splits': None, 'note': 'CV skipped: only one class present'}
+        }
     min_class = int(vc.min()) if not vc.empty else 0
     if min_class < 2:
         return {
@@ -2296,6 +2334,9 @@ def _analyze_calibration(
     results = {}
     
     # Train on synthetic, test on real
+    # If synthetic labels collapse to a single class, calibration curves are undefined.
+    if pd.Series(y_syn).dropna().nunique() < 2:
+        return {'note': 'calibration skipped: y_syn has < 2 classes'}
     lr = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler(with_mean=False)),

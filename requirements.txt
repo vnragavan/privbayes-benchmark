@@ -1,10 +1,13 @@
-# Installation Notes:
-# - For SynthCity compatibility: Install torch>=2.3.0 (required for RMSNorm support)
-#   SynthCity 0.2.12 declares torch<2.3, but RMSNorm (needed by opacus) requires >=2.3.0
-#   In practice, torch>=2.3.0 works with SynthCity despite the version constraint
-# - On macOS: torchtext may have compatibility issues and is optional for SynthCity
-# - If pandas 2.1.0 fails to build (Python 3.12+), use: pip install pandas (latest compatible version)
-# - Install torch and torchvision together: pip install torch torchvision --upgrade
+# Installation notes / known pitfalls:
+# - pandas: pandas 2.1.x predates Python 3.12 wheels; prefer pandas>=2.2 on cp312.
+# - dpmm: dpmm==0.1.9 declares Requires-Python <3.12 on PyPI; use Python 3.11 for DPMM.
+# - SynthCity + torch: SynthCity 0.2.12 declares torch>=2.1,<2.3 in metadata (so we pin that range here).
+#   However, some environments hit a runtime error like:
+#     "module 'torch.nn' has no attribute 'RMSNorm'"
+#   If that happens, the pragmatic workaround is:
+#     pip install -U "torch>=2.4,<2.5" "torchvision>=0.19,<0.20"
+#     pip install --no-deps "synthcity==0.2.12"
+# - torchtext is optional for SynthCity and may be problematic on some platforms; install manually only if needed.
 
 # Core dependencies
 numpy==1.26.4
@@ -27,8 +30,7 @@ synthcity==0.2.12
 dpmm==0.1.9; python_version < "3.12"
 
 # Deep Learning & PyTorch
-# Note: SynthCity 0.2.12 declares torch>=2.1,<2.3.
-# (Some setups try torch>=2.3 for RMSNorm support, but that conflicts with SynthCity's metadata.)
+# Note: SynthCity 0.2.12 declares torch>=2.1,<2.3 in its metadata.
 # IMPORTANT: Install torch and torchvision together to ensure version compatibility
 # For macOS: torchtext may have compatibility issues and is optional for SynthCity
 torch>=2.1,<2.3
