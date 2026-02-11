@@ -60,10 +60,21 @@ git clone <repository-url>
 cd privbayes-benchmark
 ```
 
-2. Install dependencies:
+2. Create a virtual environment and install dependencies:
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
+
+3. Verify your installation (recommended):
+```bash
+python scripts/verify_install.py
+```
+
+**Notes:**
+- The `pbbench` package uses a `src/` layout and is not installed as a wheel; scripts in this repo (including `verify_install.py`) add `src/` to `sys.path`.
+- `dpmm` may not be available on Python 3.12 via PyPI (it declares `Requires-Python <3.12`). If you need the DPMM variant, use Python 3.11, or install it separately with `--ignore-requires-python` at your own risk.
 
 ## Usage
 
