@@ -296,14 +296,43 @@ def main() -> None:
     ap.add_argument(
         "--numeric-first",
         action="store_true",
-        help="For mostly-numeric datasets, replace overlap-style panels with numeric fidelity panels "
-        "(mean normalized Wasserstein distance and mean KS statistic). Requires numeric_* metrics in JSON.",
+        default=None,
+        help="Force numeric-first utility panels (useful for mostly-numeric datasets).",
+    )
+    ap.add_argument(
+        "--no-numeric-first",
+        action="store_false",
+        dest="numeric_first",
+        help="Disable numeric-first panels (override auto-detection).",
     )
     args = ap.parse_args()
 
     json_path = _pick_results_json(args.path)
     out_dir = args.out_dir or (json_path.parent if json_path.is_file() else args.path)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Auto-enable numeric-first for mostly-numeric datasets (e.g., Breast Cancer).
+    # We infer this from runner-written metadata: tvd_metrics.params.categorical_cols / numerical_cols.
+    auto_numeric_first = False
+    try:
+        items = json.loads(json_path.read_text())
+        if isinstance(items, list) and items:
+            # Pick the first successful item that has tvd params.
+            for it in items:
+                if not isinstance(it, dict) or not it.get("success", False):
+                    continue
+                params = _get(it, "tvd_metrics.params", {}) or {}
+                num_cols = params.get("numerical_cols") or []
+                cat_cols = params.get("categorical_cols") or []
+                if isinstance(num_cols, list) and isinstance(cat_cols, list):
+                    # Heuristic: many numerics and (near) no categoricals -> numeric-first.
+                    if len(num_cols) >= 10 and len(cat_cols) <= 1:
+                        auto_numeric_first = True
+                    break
+    except Exception:
+        auto_numeric_first = False
+
+    numeric_first_effective = bool(auto_numeric_first if args.numeric_first is None else args.numeric_first)
 
     # Publication-friendly font sizes (helps readability when embedded in LaTeX).
     plt.rcParams.update(
@@ -454,7 +483,7 @@ def main() -> None:
 
         # (a) Weighted Jaccard, or (numeric-first) normalized Wasserstein/EMD
         ax = axes[0, 0]
-        if args.numeric_first and (a_wass["mean"].notna().any() or a_emd["mean"].notna().any()):
+        if numeric_first_effective and (a_wass["mean"].notna().any() or a_emd["mean"].notna().any()):
             use = a_wass if a_wass["mean"].notna().any() else a_emd
             for impl in impls:
                 d = use[use["implementation"] == impl].sort_values("epsilon")
@@ -648,7 +677,7 @@ def main() -> None:
 
         # (g) Coverage: Jaccard coverage (↑), or (numeric-first) KS (↓), or MI-matrix rank correlation (↑)
         ax = axes[2, 0]
-        if args.numeric_first and a_ks["mean"].notna().any():
+        if numeric_first_effective and a_ks["mean"].notna().any():
             for impl in impls:
                 d = a_ks[a_ks["implementation"] == impl].sort_values("epsilon")
                 _plot_line(
@@ -667,7 +696,7 @@ def main() -> None:
             ax.set_ylabel("KS statistic (↓)")
             ax.set_title("Numeric Fidelity (KS) vs ε (Lower is Better)", fontweight="bold")
             ax.set_ylim(0, 1)
-        elif args.numeric_first and a_nmi["mean"].notna().any():
+        elif numeric_first_effective and a_nmi["mean"].notna().any():
             for impl in impls:
                 d = a_nmi[a_nmi["implementation"] == impl].sort_values("epsilon")
                 _plot_line(

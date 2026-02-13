@@ -25,6 +25,8 @@ This repository provides a clean, focused comparison framework for three PrivBay
 - Exact Row Match Rate (ERMR)
 - QI Linkage Rate
 - Privacy budget allocation and transparency
+- Audit probes (optional but enabled by default in the runner): NN memorization, unique/rare leakage, conditional disclosure
+- Membership inference (MIA) distance attack (optional but enabled by default in the runner)
 
 **Performance Metrics:**
 - Training time
@@ -53,12 +55,16 @@ privbayes-benchmark/
 │           ├── pb_synthcity.py       # SynthCity PrivBayes adapter
 │           └── pb_datasynthesizer.py # DPMM PrivBayes adapter
 ├── scripts/
-│   ├── comprehensive_comparison.py        # Run benchmark + write JSON/CSV (+ default plots)
-│   ├── plot_utility_privacy_from_json.py   # One-stop plotting from comprehensive_results_*.json
-│   ├── validate_metrics_json.py            # Sanity-check metrics JSON structure/ranges
-│   ├── verify_install.py                   # Verify environment + imports + datasets
-│   ├── prepare_breast_cancer_dataset.py    # Generate data/breast_cancer.csv from sklearn
-│   └── internal/                           # Legacy/debug helpers (not needed for typical runs)
+│   ├── comprehensive_comparison.py              # Run benchmark + write JSON/CSV (+ synthetic CSVs)
+│   ├── run_paper_experiments.py                 # Orchestrate paper sweeps + plotting
+│   ├── plot_utility_privacy_from_json.py        # One-stop plotting from comprehensive_results_*.json
+│   ├── validate_metrics_json.py                 # Sanity-check results JSON structure/ranges
+│   ├── verify_install.py                        # Verify environment + imports + datasets
+│   ├── prepare_breast_cancer_dataset.py         # Generate data/breast_cancer.csv from sklearn
+│   ├── prepare_schema_from_csv.py               # Generate candidate public-schema JSON
+│   ├── validate_schema_json.py                  # Validate schema JSON (+ optional dataset cross-check)
+│   ├── recompute_qi_linkage.py                  # Maintenance: recompute QI linkage for existing JSONs
+│   └── internal/                                # Legacy/debug helpers (not needed for typical runs)
 ├── docs/                      # Project docs (structure, workflows, results layout)
 │   ├── PROJECT_STRUCTURE.md
 │   ├── WORKFLOWS.md
@@ -170,6 +176,9 @@ python scripts/comprehensive_comparison.py \
     --out-dir runs/example_adult \
     --implementations Enhanced SynthCity DPMM
 ```
+
+Notes:
+- `--audit` and `--audit-mia` are **enabled by default**. Disable for faster runs with `--no-audit` and/or `--no-audit-mia`.
 
 ### Recommended: Multi-ε trends with uncertainty (multiple seeds)
 
@@ -306,6 +315,12 @@ python scripts/plot_utility_privacy_from_json.py results_dir --prefix my_plots
 # Plot with uncertainty across seeds (requires multiple seeds in the JSON)
 python scripts/plot_utility_privacy_from_json.py results_dir --prefix my_plots_ci95 --uncertainty ci95
 ```
+
+For mostly-numeric datasets (like Breast Cancer), you can use `--numeric-first` to replace overlap-heavy panels
+with numeric-fidelity panels (e.g., normalized EMD/Wasserstein).
+
+Note: the plotter will automatically enable numeric-first panels when the results JSON indicates the dataset is
+mostly numeric. Use `--no-numeric-first` to override.
 
 ## Recommended “paper runs” workflow
 
