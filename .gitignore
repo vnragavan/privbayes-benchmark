@@ -3,11 +3,31 @@
 # Python caches
 **/__pycache__/
 **/*.pyc
+**/*.egg-info/
 
 # Local benchmark outputs / artifacts (large)
 medical_*/
 quick_test*/
 results*/
+paper_runs*/
+paper_runs_*/
+runs*/
+quick_audit_test/
+strictdp_*/
 
 # Common generated artifacts
 *.log
+*.aux
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+
+# Local compiled paper artifacts
+breast_cancer_privbayes_benchmark_article.pdf
+
+# LaTeX build artifacts (paper)
+journal_submission/*.pdf
+journal_submission/*.bbl
+journal_submission/*.blg
+journal_submission/*.listing

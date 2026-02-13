@@ -50,6 +50,170 @@ from pbbench.enhanced_metrics import (
     comprehensive_downstream_metrics,
 )
 
+# Minimum viable privacy audit probes (optional)
+from pbbench.privacy_audit import (
+    _select_qi_cols as _audit_select_qi_cols,
+    conditional_disclosure_l1,
+    membership_inference_distance_attack,
+    nearest_neighbor_memorization,
+    rare_combination_leakage,
+    unique_pattern_leakage,
+)
+
+# ---------------- DP-safe public domains (for strict-dp mode) ----------------
+
+_ADULT_PUBLIC_CATEGORIES: dict[str, list[str]] = {
+    # UCI Adult / Census Income (public schema)
+    "workclass": [
+        "Private",
+        "Self-emp-not-inc",
+        "Self-emp-inc",
+        "Federal-gov",
+        "Local-gov",
+        "State-gov",
+        "Without-pay",
+        "Never-worked",
+    ],
+    "education": [
+        "Bachelors",
+        "Some-college",
+        "11th",
+        "HS-grad",
+        "Prof-school",
+        "Assoc-acdm",
+        "Assoc-voc",
+        "9th",
+        "7th-8th",
+        "12th",
+        "Masters",
+        "1st-4th",
+        "10th",
+        "Doctorate",
+        "5th-6th",
+        "Preschool",
+    ],
+    "marital-status": [
+        "Never-married",
+        "Married-civ-spouse",
+        "Divorced",
+        "Married-spouse-absent",
+        "Separated",
+        "Married-AF-spouse",
+        "Widowed",
+    ],
+    "occupation": [
+        "Tech-support",
+        "Craft-repair",
+        "Other-service",
+        "Sales",
+        "Exec-managerial",
+        "Prof-specialty",
+        "Handlers-cleaners",
+        "Machine-op-inspct",
+        "Adm-clerical",
+        "Farming-fishing",
+        "Transport-moving",
+        "Priv-house-serv",
+        "Protective-serv",
+        "Armed-Forces",
+    ],
+    "relationship": [
+        "Wife",
+        "Own-child",
+        "Husband",
+        "Not-in-family",
+        "Other-relative",
+        "Unmarried",
+    ],
+    "race": [
+        "White",
+        "Asian-Pac-Islander",
+        "Amer-Indian-Eskimo",
+        "Other",
+        "Black",
+    ],
+    "sex": ["Female", "Male"],
+    "native-country": [
+        "United-States",
+        "Cambodia",
+        "England",
+        "Puerto-Rico",
+        "Canada",
+        "Germany",
+        "Outlying-US(Guam-USVI-etc)",
+        "India",
+        "Japan",
+        "Greece",
+        "South",
+        "China",
+        "Cuba",
+        "Iran",
+        "Honduras",
+        "Philippines",
+        "Italy",
+        "Poland",
+        "Jamaica",
+        "Vietnam",
+        "Mexico",
+        "Portugal",
+        "Ireland",
+        "France",
+        "Dominican-Republic",
+        "Laos",
+        "Ecuador",
+        "Taiwan",
+        "Haiti",
+        "Columbia",
+        "Hungary",
+        "Guatemala",
+        "Nicaragua",
+        "Scotland",
+        "Thailand",
+        "Yugoslavia",
+        "El-Salvador",
+        "Trinadad&Tobago",
+        "Peru",
+        "Hong",
+        "Holand-Netherlands",
+    ],
+    # label column
+    "income": ["<=50K", ">50K"],
+}
+
+
+def _infer_dataset_tag(df: pd.DataFrame) -> str:
+    cols = set(map(str, df.columns))
+    if "income" in cols and "workclass" in cols and "education" in cols:
+        return "adult"
+    if "target" in cols and "mean radius" in cols:
+        return "breast_cancer"
+    return "unknown"
+
+
+def _public_label_categories(target_col: Optional[str]) -> Optional[list[str]]:
+    if target_col is None:
+        return None
+    if target_col == "income":
+        return ["<=50K", ">50K"]
+    if target_col == "target":
+        return ["0", "1"]
+    return None
+
+
+def _load_public_schema(schema_path: Optional[str]) -> dict[str, Any]:
+    if not schema_path:
+        return {}
+    p = schema_path
+    try:
+        with open(p, "r") as f:
+            obj = json.load(f)
+        if not isinstance(obj, dict):
+            raise ValueError("schema must be a JSON object")
+        return obj
+    except Exception as e:
+        raise RuntimeError(f"Failed to load schema JSON from '{p}': {e}") from e
+
+
 # ---------- Enhanced vocab alignment helpers ----------
 import hashlib as _hlib
 
@@ -114,6 +278,8 @@ def align_real_to_enhanced_vocab(enhanced_adapter, real_df: pd.DataFrame) -> pd.
 class ImplementationResult:
     """Results for one implementation at one epsilon/seed"""
     name: str
+    implementation_base: str
+    regime: str  # "default" | "strict"
     epsilon: float
     seed: int
     success: bool
@@ -144,21 +310,45 @@ class ImplementationResult:
     # Privacy Attacks
     exact_row_match_rate: Optional[float] = None
     qi_linkage_rate: Optional[float] = None
+
+    # Privacy audit probes (minimum viable set; optional)
+    audit_metrics: Optional[Dict[str, Any]] = None
     
     # Synthetic data path
     synthetic_data_path: Optional[str] = None
 
 
-def run_synthcity_privbayes(real: pd.DataFrame, epsilon: float, seed: int, 
-                           n_samples: Optional[int] = None) -> ImplementationResult:
+def _label_impl(base: str, regime: str) -> str:
+    if regime == "strict":
+        return f"{base} (strict-DP)"
+    return f"{base} (default)"
+
+def run_synthcity_privbayes(
+    real: pd.DataFrame,
+    epsilon: float,
+    seed: int,
+    n_samples: Optional[int] = None,
+    strict_dp: bool = False,
+    regime: str = "default",
+) -> ImplementationResult:
     """Run SynthCity PrivBayes implementation and measure performance.
     
     Tracks fit time, sample time, memory usage. Returns result object with
     synthetic data and original real data for metric computation.
     """
-    result = ImplementationResult(name="SynthCity", epsilon=epsilon, seed=seed, success=False)
+    base = "SynthCity"
+    result = ImplementationResult(
+        name=_label_impl(base, regime),
+        implementation_base=base,
+        regime=regime,
+        epsilon=epsilon,
+        seed=seed,
+        success=False,
+    )
     
     try:
+        if strict_dp:
+            raise RuntimeError("strict-dp enabled: SynthCity PrivBayes is not DP-compliant; skipping.")
         from pbbench.variants.pb_synthcity import SynthcityPrivBayesAdapter
         
         tracemalloc.start()
@@ -204,27 +394,77 @@ def run_synthcity_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
         return result, None, real
 
 
-def run_dpmm_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
-                       n_samples: Optional[int] = None) -> ImplementationResult:
+def run_dpmm_privbayes(
+    real: pd.DataFrame,
+    epsilon: float,
+    seed: int,
+    n_samples: Optional[int] = None,
+    strict_dp: bool = False,
+    dataset_tag: str = "unknown",
+    target_col: Optional[str] = None,
+    regime: str = "default",
+    preprocess: str = "none",
+    public_bounds: Optional[dict] = None,
+    public_categories: Optional[dict] = None,
+) -> ImplementationResult:
     """Run DPMM PrivBayes implementation and measure performance.
     
     Discretizes data to integers before fitting (DPMM requirement). Tracks
     timing and memory. Returns result with synthetic and real data.
     """
-    result = ImplementationResult(name="DPMM", epsilon=epsilon, seed=seed, success=False)
+    base = "DPMM"
+    result = ImplementationResult(
+        name=_label_impl(base, regime),
+        implementation_base=base,
+        regime=regime,
+        epsilon=epsilon,
+        seed=seed,
+        success=False,
+    )
     
     try:
         from pbbench.variants.pb_datasynthesizer import DPMMPrivBayesAdapter
         
         tracemalloc.start()
         start_time = time.time()
-        
+
+        pb = dict(public_bounds or {})
+        pc = dict(public_categories or {})
+        if strict_dp and dataset_tag == "adult" and not pc:
+            pc = dict(_ADULT_PUBLIC_CATEGORIES)
+
+        # Ensure label domain is treated as categorical for DPMM too.
+        # Without this, binary labels like breast-cancer "target" get treated as numeric,
+        # decoded as continuous midpoints, and downstream ML becomes undefined.
+        detected_target_col = target_col
+        if detected_target_col is None:
+            for col in ["target", "income", "label", "class", "outcome"]:
+                if col in real.columns:
+                    detected_target_col = col
+                    break
+        if detected_target_col and detected_target_col in real.columns:
+            pub = _public_label_categories(detected_target_col)
+            if pub is not None:
+                pc.setdefault(detected_target_col, pub)
+            elif not strict_dp:
+                unique_labels = sorted(real[detected_target_col].astype(str).dropna().unique().tolist())
+                pc.setdefault(detected_target_col, unique_labels)
+
+        # dpmm multiprocessing is fragile on macOS; keep single-process by default
         model = DPMMPrivBayesAdapter(
             epsilon=epsilon,
             delta=1.0 / (len(real) ** 2),
             degree=2,
             n_bins=50,
-            seed=seed
+            seed=seed,
+            preprocess=("dp" if strict_dp else str(preprocess)),
+            strict_dp=bool(strict_dp),
+            public_bounds=pb if pb else None,
+            public_categories=pc if pc else None,
+            int_cardinality_as_categorical=20,
+            n_jobs=1,
+            compress=True,
+            n_iters=2000 if dataset_tag == "adult" else 1000,
         )
         
         fit_start = time.time()
@@ -257,13 +497,26 @@ def run_dpmm_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
 
 def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int, 
                           temperature: float = 1.0, target_col: Optional[str] = None,
-                          n_samples: Optional[int] = None) -> ImplementationResult:
+                          n_samples: Optional[int] = None,
+                          strict_dp: bool = False,
+                          dataset_tag: str = "unknown",
+                          regime: str = "default",
+                          public_bounds_schema: Optional[dict] = None,
+                          public_categories_schema: Optional[dict] = None) -> ImplementationResult:
     """Run Enhanced PrivBayes implementation and measure performance.
     
     Auto-detects target column for label handling. Sets up public bounds
     and categories. Returns aligned real data (vocab-matched) for fair comparison.
     """
-    result = ImplementationResult(name="Enhanced", epsilon=epsilon, seed=seed, success=False)
+    base = "Enhanced"
+    result = ImplementationResult(
+        name=_label_impl(base, regime),
+        implementation_base=base,
+        regime=regime,
+        epsilon=epsilon,
+        seed=seed,
+        success=False,
+    )
     
     try:
         from pbbench.variants.pb_enhanced import EnhancedPrivBayesAdapter
@@ -274,25 +527,30 @@ def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
         # WARNING: Using actual min/max from data is a privacy leak if bounds aren't public knowledge.
         # Set use_dp_bounds=True to use DP bounds discovery instead (fully DP-compliant).
         # For now, we compute bounds from data for utility, but this should be avoided for private data.
-        use_dp_bounds = False  # Set to True for full DP compliance (uses eps_disc for bounds)
+        use_dp_bounds = bool(strict_dp)  # True => DP bounds discovery via eps_disc
         public_bounds = {}
         original_data_bounds = {}
         
         if not use_dp_bounds:
-            # Non-DP bounds discovery (privacy leak if bounds aren't public knowledge)
-            for col in real.columns:
-                if pd.api.types.is_numeric_dtype(real[col]):
-                    vmin, vmax = float(real[col].min()), float(real[col].max())
-                    margin = (vmax - vmin) * 0.1
-                    public_bounds[col] = [vmin - margin, vmax + margin]
-                    original_data_bounds[col] = [vmin, vmax]
-                elif real[col].dtype == 'object':
-                    s = pd.to_numeric(real[col], errors='coerce')
-                    if s.notna().mean() >= 0.95:
-                        vmin, vmax = float(s.min()), float(s.max())
+            if public_bounds_schema:
+                # Public-schema mode: bounds are assumed public side information.
+                public_bounds = dict(public_bounds_schema)
+                original_data_bounds = None
+            else:
+                # Non-DP bounds discovery (privacy leak if bounds aren't public knowledge)
+                for col in real.columns:
+                    if pd.api.types.is_numeric_dtype(real[col]):
+                        vmin, vmax = float(real[col].min()), float(real[col].max())
                         margin = (vmax - vmin) * 0.1
                         public_bounds[col] = [vmin - margin, vmax + margin]
                         original_data_bounds[col] = [vmin, vmax]
+                    elif real[col].dtype == 'object':
+                        s = pd.to_numeric(real[col], errors='coerce')
+                        if s.notna().mean() >= 0.95:
+                            vmin, vmax = float(s.min()), float(s.max())
+                            margin = (vmax - vmin) * 0.1
+                            public_bounds[col] = [vmin - margin, vmax + margin]
+                            original_data_bounds[col] = [vmin, vmax]
         else:
             # DP-compliant: Use DP bounds discovery (set public_bounds=None)
             # The model will use eps_disc to discover bounds with DP
@@ -309,15 +567,20 @@ def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
         
         # Set up label columns and public categories
         label_columns = []
-        public_categories = {}
+        public_categories = dict(public_categories_schema or {})
         if detected_target_col and detected_target_col in real.columns:
             label_columns = [detected_target_col]
-            # WARNING: Getting unique values from real data reveals label distribution.
-            # This is acceptable for labels if the class names are public knowledge
-            # (e.g., binary classification with known classes like '<=50K'/'>50K').
-            # For private label domains, provide public_categories explicitly.
-            unique_labels = sorted(real[detected_target_col].astype(str).dropna().unique().tolist())
-            public_categories[detected_target_col] = unique_labels
+            pub = _public_label_categories(detected_target_col)
+            if pub is not None:
+                public_categories[detected_target_col] = pub
+            elif strict_dp:
+                raise RuntimeError(
+                    f"strict-dp enabled: unknown public label domain for target_col='{detected_target_col}'."
+                )
+            else:
+                # Legacy (non-DP): infer label domain from data
+                unique_labels = sorted(real[detected_target_col].astype(str).dropna().unique().tolist())
+                public_categories[detected_target_col] = unique_labels
         
         # WARNING: Auto-discovering categories from training data is NOT DP-compliant.
         # This reveals the exact set of categories in the data, which is a privacy leak.
@@ -344,7 +607,8 @@ def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
             public_bounds=public_bounds if public_bounds else None,
             label_columns=label_columns if label_columns else None,
             public_categories=public_categories if public_categories else None,
-            cat_keep_all_nonzero=True,  # Keep all categories to avoid UNK
+            # Keeping all non-zero noisy buckets is DP-safe (post-processing) and reduces UNK.
+            cat_keep_all_nonzero=True,
             bins_per_numeric=50,
             max_parents=2,
             eps_split={"structure": 0.3, "cpt": 0.7},
@@ -499,7 +763,11 @@ def compute_comprehensive_utility(
         print("    Computing downstream ML metrics...", flush=True)
         try:
             metrics["downstream"] = comprehensive_downstream_metrics(
-                real, syn, target_col=target_col, n_bootstrap=n_bootstrap
+                real,
+                syn,
+                target_col=target_col,
+                n_bootstrap=n_bootstrap,
+                n_jobs=1,  # avoid joblib/multiprocessing hangs on some platforms (notably macOS)
             )
         except Exception as e:
             print(f"    ⚠️ Downstream failed: {e}")
@@ -526,32 +794,163 @@ def compute_privacy_attacks(real: pd.DataFrame, syn: pd.DataFrame) -> Dict[str, 
     except:
         metrics['exact_row_match_rate'] = None
     
-    # QI Linkage (simplified)
+    # QI Linkage (robust + "linkable" = matches a UNIQUE real QI pattern)
+    # This avoids the degenerate behavior of simple "tuple exists in real" overlap,
+    # which can saturate at 1.0 on large datasets.
     try:
-        # Use top 3 columns with highest variance as QI
-        numeric_cols = (
-            real.select_dtypes(include=[np.number])
-                .var(numeric_only=True)
-                .sort_values(ascending=False)
-                .head(3)
-                .index
-                .tolist()
-        )
-        if len(numeric_cols) > 0:
-            qi_cols = list(numeric_cols)
-            # Discretize for linkage - use robust numeric dtype check
-            real_qi = real[qi_cols].apply(lambda x: pd.qcut(x, q=5, labels=False, duplicates='drop') if pd.api.types.is_numeric_dtype(x) else x)
-            syn_qi = syn[qi_cols].apply(lambda x: pd.qcut(x, q=5, labels=False, duplicates='drop') if pd.api.types.is_numeric_dtype(x) else x)
-            
-            real_keys = set(pd.util.hash_pandas_object(real_qi, index=False).astype(str))
-            syn_keys = pd.util.hash_pandas_object(syn_qi, index=False).astype(str)
-            metrics['qi_linkage_rate'] = sum(1 for k in syn_keys if k in real_keys) / len(syn)
-        else:
-            metrics['qi_linkage_rate'] = None
+        def _qcut_bin_count(s: pd.Series, q: int = 5) -> int:
+            ss = pd.to_numeric(s, errors="coerce").dropna()
+            if ss.size < 2:
+                return 0
+            try:
+                codes = pd.qcut(ss, q=int(q), labels=False, duplicates="drop")
+                return int(pd.Series(codes).nunique(dropna=True))
+            except Exception:
+                return 0
+
+        # Candidate categorical QIs: moderate cardinality, not dominated by one value.
+        cat_candidates: list[tuple[float, str]] = []
+        for c in real.columns:
+            if c not in syn.columns:
+                continue
+            if pd.api.types.is_numeric_dtype(real[c]):
+                continue
+            rr = real[c].astype("string").fillna("__NA__")
+            nunq = int(rr.nunique(dropna=True))
+            if nunq < 2 or nunq > 50:
+                continue
+            top_frac = float(rr.value_counts(normalize=True, dropna=True).iloc[0])
+            if top_frac > 0.90:
+                continue
+            # entropy proxy
+            p = rr.value_counts(normalize=True, dropna=True).to_numpy()
+            ent = float(-(p * np.log(p + 1e-12)).sum())
+            cat_candidates.append((ent, c))
+        cat_candidates.sort(reverse=True)
+        cat_cols = [c for _, c in cat_candidates[:2]]
+
+        # Candidate numeric QIs: variance high, and real qcut produces >=3 bins.
+        num_candidates: list[tuple[float, str]] = []
+        rnum = real.select_dtypes(include=[np.number])
+        for c in rnum.columns:
+            if c not in syn.columns:
+                continue
+            s = pd.to_numeric(rnum[c], errors="coerce").dropna()
+            if s.empty or int(s.nunique(dropna=True)) < 10:
+                continue
+            if _qcut_bin_count(s, q=5) < 3:
+                continue
+            var = float(s.var())
+            if np.isfinite(var) and var > 0:
+                num_candidates.append((var, c))
+        num_candidates.sort(reverse=True)
+        num_cols = [c for _, c in num_candidates[: max(1, 3 - len(cat_cols))]]
+
+        qi_cols = cat_cols + num_cols
+        qi_cols = qi_cols[:3]
+        if len(qi_cols) == 0:
+            metrics["qi_linkage_rate"] = None
+            return metrics
+
+        def _bin_numeric_from_real(real_col: pd.Series, syn_col: pd.Series, q: int = 5) -> tuple[pd.Series, pd.Series]:
+            rr = pd.to_numeric(real_col, errors="coerce")
+            ss = pd.to_numeric(syn_col, errors="coerce")
+            ok = rr.notna()
+            if ok.sum() < 2:
+                return pd.Series([0] * len(real_col)), pd.Series([0] * len(syn_col))
+            try:
+                _, bins = pd.qcut(rr[ok], q=int(q), retbins=True, duplicates="drop")
+                if len(bins) >= 2:
+                    ss = ss.clip(lower=float(bins[0]), upper=float(bins[-1]))
+                r_codes = pd.cut(rr, bins=bins, labels=False, include_lowest=True)
+                s_codes = pd.cut(ss, bins=bins, labels=False, include_lowest=True)
+            except Exception:
+                lo = float(np.nanmin(rr.to_numpy()))
+                hi = float(np.nanmax(rr.to_numpy()))
+                if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+                    return pd.Series([0] * len(real_col)), pd.Series([0] * len(syn_col))
+                bins = np.linspace(lo, hi, int(q) + 1)
+                ss = ss.clip(lower=float(bins[0]), upper=float(bins[-1]))
+                r_codes = pd.cut(rr, bins=bins, labels=False, include_lowest=True)
+                s_codes = pd.cut(ss, bins=bins, labels=False, include_lowest=True)
+            r_out = pd.to_numeric(r_codes, errors="coerce").fillna(-1).astype(int)
+            s_out = pd.to_numeric(s_codes, errors="coerce").fillna(-1).astype(int)
+            return r_out, s_out
+
+        # Build aligned discrete QI views
+        real_qi: dict[str, Any] = {}
+        syn_qi: dict[str, Any] = {}
+        for c in qi_cols:
+            if pd.api.types.is_numeric_dtype(real[c]):
+                rc, sc = _bin_numeric_from_real(real[c], syn[c], q=5)
+                real_qi[c] = rc
+                syn_qi[c] = sc
+            else:
+                rr = real[c].astype("string").fillna("__NA__")
+                ss = syn[c].astype("string").fillna("__NA__")
+                # unseen synthetic categories are kept as-is; linkage is about exact matching
+                real_qi[c] = rr
+                syn_qi[c] = ss
+
+        real_qi_df = pd.DataFrame(real_qi)
+        syn_qi_df = pd.DataFrame(syn_qi)
+
+        # Define "linkable" as matching a UNIQUE real QI tuple (support==1).
+        real_tuples = list(map(tuple, real_qi_df.to_numpy()))
+        vc = pd.Series(real_tuples).value_counts()
+        unique_real = set(vc[vc == 1].index.tolist())
+        if len(syn) == 0:
+            metrics["qi_linkage_rate"] = None
+            return metrics
+        syn_tuples = list(map(tuple, syn_qi_df.to_numpy()))
+        metrics["qi_linkage_rate"] = float(sum(1 for t in syn_tuples if t in unique_real) / len(syn))
     except:
         metrics['qi_linkage_rate'] = None
     
     return metrics
+
+
+def compute_min_viable_privacy_audit(
+    real: pd.DataFrame,
+    syn: pd.DataFrame,
+    *,
+    target_col: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Minimum viable audit set (model-agnostic, computed from REAL + SYN):
+    - nearest-neighbor memorization (EMR)
+    - unique pattern leakage (support=1 patterns)
+    - rare combination leakage (tau=3)
+    - conditional disclosure leakage (L1 distance) using QI heuristic + sensitive=target_col
+    """
+    out: Dict[str, Any] = {}
+
+    qi_cols = _audit_select_qi_cols(real, k=3)
+    sens = target_col if target_col and target_col in real.columns else None
+    if sens is None and len(real.columns) > 0:
+        sens = str(real.columns[-1])
+
+    mem = nearest_neighbor_memorization(real, syn, n_bins=20)
+    out["nn_memorization"] = {"emr": mem.emr, "mean_dsyn": mem.mean_dsyn, "mean_dreal": mem.mean_dreal}
+
+    out["unique_pattern_leakage"] = unique_pattern_leakage(real, syn, n_bins=20)
+    rare = rare_combination_leakage(real, syn, tau=3, n_bins=20)
+    out["rare_combination"] = {"tau": 3, "rmr": rare.rmr, "mae": rare.mae}
+
+    if sens is not None and sens in real.columns and sens in syn.columns:
+        out["conditional_disclosure_l1"] = conditional_disclosure_l1(
+            real,
+            syn,
+            qi_cols=qi_cols,
+            sensitive_col=sens,
+            n_bins=20,
+        )
+        out["conditional_disclosure_meta"] = {"qi_cols": qi_cols, "sensitive_col": sens}
+    else:
+        out["conditional_disclosure_l1"] = None
+        out["conditional_disclosure_meta"] = {"qi_cols": qi_cols, "sensitive_col": sens}
+
+    return out
 
 
 # ==================== VISUALIZATION ====================
@@ -851,10 +1250,23 @@ def create_utility_privacy_plots(results: List[ImplementationResult], out_dir: s
 
 # ==================== MAIN ====================
 
-def main(data_path: str, epsilons: List[float], seeds: List[int],
-         out_dir: str, implementations: List[str], target_col: Optional[str] = None,
-         n_samples: Optional[int] = None,
-         n_bootstrap: int = 30):
+def main(
+    data_path: str,
+    epsilons: List[float],
+    seeds: List[int],
+    out_dir: str,
+    implementations: List[str],
+    target_col: Optional[str] = None,
+    n_samples: Optional[int] = None,
+    n_bootstrap: int = 30,
+    audit: bool = False,
+    audit_mia: bool = False,
+    audit_mia_holdout_frac: float = 0.3,
+    audit_mia_impls: Optional[List[str]] = None,
+    regimes: Optional[List[str]] = None,  # ["default"] or ["default","strict"]
+    dpmm_default_preprocess: str = "none",  # "none" | "public" | "dp"
+    schema: Optional[str] = None,
+):
     """Run comprehensive benchmark comparing PrivBayes implementations.
     
     Executes all combinations of epsilon/seed/implementation. Computes utility,
@@ -867,8 +1279,19 @@ def main(data_path: str, epsilons: List[float], seeds: List[int],
     print(f"Epsilon values: {epsilons}")
     print(f"Seeds: {seeds}")
     print(f"Implementations: {implementations}")
+    regimes = regimes or ["default"]
+    regimes = [r.strip().lower() for r in regimes]
+    regimes = [r for r in regimes if r in {"default", "strict"}]
+    if not regimes:
+        regimes = ["default"]
+    print(f"Regimes: {regimes}")
     print(f"Output: {out_dir}")
     print(f"Bootstrap resamples (for CI): {n_bootstrap}")
+    print(f"DPMM default preprocess: {dpmm_default_preprocess}")
+    if audit:
+        print("Privacy audit probes: enabled (min viable)")
+    if audit_mia:
+        print(f"Membership inference: enabled (holdout_frac={audit_mia_holdout_frac})")
     if target_col:
         print(f"Target column: {target_col}")
     if n_samples:
@@ -881,6 +1304,19 @@ def main(data_path: str, epsilons: List[float], seeds: List[int],
     print("\n📊 Loading data...")
     real = pd.read_csv(data_path)
     print(f"✓ Loaded: {real.shape[0]} rows, {real.shape[1]} columns")
+
+    dataset_tag = _infer_dataset_tag(real)
+    print(f"Dataset tag: {dataset_tag}")
+
+    public_schema = _load_public_schema(schema)
+    public_bounds_schema = public_schema.get("public_bounds") if isinstance(public_schema, dict) else None
+    public_categories_schema = public_schema.get("public_categories") if isinstance(public_schema, dict) else None
+    if schema:
+        print(f"Public schema: {schema}")
+        if isinstance(public_bounds_schema, dict):
+            print(f"  - public_bounds: {len(public_bounds_schema)} entries")
+        if isinstance(public_categories_schema, dict):
+            print(f"  - public_categories: {len(public_categories_schema)} columns")
     
     print(f"\n📁 Creating output directory: {out_dir}")
     os.makedirs(out_dir, exist_ok=True)
@@ -889,76 +1325,205 @@ def main(data_path: str, epsilons: List[float], seeds: List[int],
     # Run all experiments
     all_results = []
     
-    for eps in epsilons:
-        for seed in seeds:
-            print(f"\n{'='*80}")
-            print(f" EPSILON={eps}, SEED={seed} ".center(80, "="))
-            print(f"{'='*80}")
-            
-            for impl_name in implementations:
-                print(f"\n🔹 Running {impl_name}...")
+    for regime in regimes:
+        strict_dp = regime == "strict"
+        print(f"\n{'='*80}")
+        print(f" REGIME={regime} ".center(80, "="))
+        print(f"{'='*80}")
+
+        for eps in epsilons:
+            for seed in seeds:
+                print(f"\n{'='*80}")
+                print(f" EPSILON={eps}, SEED={seed} ".center(80, "="))
+                print(f"{'='*80}")
                 
-                # Run implementation
-                if impl_name == "SynthCity":
-                    result, syn, eval_real = run_synthcity_privbayes(real, eps, seed, n_samples=n_samples)
-                elif impl_name == "DPMM":
-                    result, syn, eval_real = run_dpmm_privbayes(real, eps, seed, n_samples=n_samples)
-                elif impl_name == "Enhanced":
-                    result, syn, eval_real = run_enhanced_privbayes(real, eps, seed, temperature=1.0, target_col=target_col, n_samples=n_samples)
-                else:
-                    print(f"⚠️ Unknown implementation: {impl_name}")
-                    continue
-                
-                if not result.success:
-                    print(f"❌ {impl_name} failed: {result.error}")
+                for impl_name in implementations:
+                    if strict_dp and impl_name == "SynthCity":
+                        print("\n🔹 Running SynthCity...")
+                        print("  ⏭️  Skipped in strict regime (not DP-compliant).")
+                        # still record a failure row so plots/tables can show omission if desired
+                        r = ImplementationResult(
+                            name=_label_impl("SynthCity", regime),
+                            implementation_base="SynthCity",
+                            regime=regime,
+                            epsilon=eps,
+                            seed=seed,
+                            success=False,
+                            error="Skipped: strict regime; SynthCity not DP-compliant.",
+                        )
+                        all_results.append(r)
+                        continue
+
+                    disp = _label_impl(impl_name, regime) if impl_name in {"Enhanced", "DPMM", "SynthCity"} else impl_name
+                    print(f"\n🔹 Running {disp}...")
+                    
+                    # Run implementation
+                    if impl_name == "SynthCity":
+                        result, syn, eval_real = run_synthcity_privbayes(
+                            real,
+                            eps,
+                            seed,
+                            n_samples=n_samples,
+                            strict_dp=False,
+                            regime=regime,
+                        )
+                    elif impl_name == "DPMM":
+                        result, syn, eval_real = run_dpmm_privbayes(
+                            real,
+                            eps,
+                            seed,
+                            n_samples=n_samples,
+                            strict_dp=strict_dp,
+                            dataset_tag=dataset_tag,
+                            target_col=target_col,
+                            regime=regime,
+                            preprocess=dpmm_default_preprocess,
+                            public_bounds=(public_bounds_schema if (not strict_dp) else None),
+                            public_categories=(public_categories_schema if (not strict_dp) else None),
+                        )
+                    elif impl_name == "Enhanced":
+                        result, syn, eval_real = run_enhanced_privbayes(
+                            real,
+                            eps,
+                            seed,
+                            temperature=1.0,
+                            target_col=target_col,
+                            n_samples=n_samples,
+                            strict_dp=strict_dp,
+                            dataset_tag=dataset_tag,
+                            regime=regime,
+                            public_bounds_schema=(public_bounds_schema if (not strict_dp) else None),
+                            # Allow strict-DP to consume PUBLIC categorical domains (same principle as DPMM):
+                            # domains are public side information and do not cost epsilon.
+                            public_categories_schema=public_categories_schema,
+                        )
+                    else:
+                        print(f"⚠️ Unknown implementation: {impl_name}")
+                        continue
+
+                    if not result.success:
+                        print(f"❌ {impl_name} failed: {result.error}")
+                        all_results.append(result)
+                        continue
+
+                    time_breakdown = f"fit={result.fit_time_sec:.2f}s, sample={result.sample_time_sec:.2f}s"
+                    if result.vocab_align_time_sec is not None:
+                        time_breakdown += f", vocab_align={result.vocab_align_time_sec:.2f}s"
+                    print(f"✓ Generated in {result.total_time_sec:.2f}s ({time_breakdown}) using {result.peak_memory_mb:.1f} MB")
+
+                    # Compute metrics using eval_real (aligned for Enhanced, original for others)
+                    print(f"  Computing utility metrics...")
+                    basic_util = compute_basic_utility(eval_real, syn)
+                    result.jaccard = basic_util['jaccard']
+                    result.weighted_jaccard = basic_util['weighted_jaccard']
+                    result.marginal_error = basic_util['marginal_error']
+                    print(f"  ✓ Basic: Jaccard={result.jaccard:.3f}, W-Jaccard={result.weighted_jaccard:.3f}")
+
+                    print(f"  Computing comprehensive utility...")
+                    # Use provided target column or auto-detect (common names: 'target', 'income', 'label', 'class')
+                    detected_target_col = target_col
+                    if detected_target_col is None:
+                        for col in ['target', 'income', 'label', 'class', 'outcome']:
+                            if col in eval_real.columns:
+                                detected_target_col = col
+                                break
+                    comp_util = compute_comprehensive_utility(
+                        eval_real, syn, target_col=detected_target_col, n_bootstrap=n_bootstrap
+                    )
+                    result.tvd_metrics = comp_util.get('tvd', {})
+                    result.mi_metrics = comp_util.get('mi', {})
+                    result.correlation_metrics = comp_util.get('correlation', {})
+                    result.coverage_metrics = comp_util.get('coverage', {})
+                    result.downstream_metrics = comp_util.get('downstream', {})
+
+                    print(f"  Computing privacy attacks...")
+                    privacy_attacks = compute_privacy_attacks(eval_real, syn)
+                    result.exact_row_match_rate = privacy_attacks['exact_row_match_rate']
+                    result.qi_linkage_rate = privacy_attacks['qi_linkage_rate']
+                    if result.exact_row_match_rate is not None:
+                        print(f"  ✓ ERMR={result.exact_row_match_rate:.4f}, QI-Link={result.qi_linkage_rate:.4f}")
+
+                    if audit:
+                        print("  Computing privacy audit probes (min viable)...", flush=True)
+                        result.audit_metrics = compute_min_viable_privacy_audit(
+                            eval_real, syn, target_col=detected_target_col
+                        )
+
+                    if audit_mia:
+                        mia_impls = audit_mia_impls or implementations
+                        if result.implementation_base in set(mia_impls):
+                            print("  Computing membership inference (distance attack; extra fit)...", flush=True)
+                            rng = np.random.default_rng(seed)
+                            idx = np.arange(len(real))
+                            rng.shuffle(idx)
+                            frac = float(np.clip(audit_mia_holdout_frac, 0.05, 0.5))
+                            n_holdout = int(frac * len(idx))
+                            hold = idx[:n_holdout]
+                            train = idx[n_holdout:]
+                            real_train = real.iloc[train].reset_index(drop=True)
+                            real_holdout = real.iloc[hold].reset_index(drop=True)
+
+                            syn_train = None
+                            try:
+                                if result.implementation_base == "Enhanced":
+                                    _, syn_train, _ = run_enhanced_privbayes(
+                                        real_train,
+                                        eps,
+                                        seed,
+                                        temperature=1.0,
+                                        target_col=target_col,
+                                        n_samples=len(real_train),
+                                        strict_dp=strict_dp,
+                                        dataset_tag=dataset_tag,
+                                        regime=regime,
+                                        public_categories_schema=public_categories_schema,
+                                    )
+                                elif result.implementation_base == "SynthCity":
+                                    _, syn_train, _ = run_synthcity_privbayes(
+                                        real_train,
+                                        eps,
+                                        seed,
+                                        n_samples=len(real_train),
+                                        strict_dp=False,
+                                        regime=regime,
+                                    )
+                                elif result.implementation_base == "DPMM":
+                                    _, syn_train, _ = run_dpmm_privbayes(
+                                        real_train,
+                                        eps,
+                                        seed,
+                                        n_samples=len(real_train),
+                                        strict_dp=strict_dp,
+                                        dataset_tag=dataset_tag,
+                                        target_col=target_col,
+                                        regime=regime,
+                                        preprocess=dpmm_default_preprocess,
+                                    )
+                            except Exception as e:
+                                if result.audit_metrics is None:
+                                    result.audit_metrics = {}
+                                result.audit_metrics["membership_inference_error"] = str(e)
+
+                            if syn_train is not None:
+                                mia = membership_inference_distance_attack(
+                                    real_train, real_holdout, syn_train, n_bins=20
+                                )
+                                if result.audit_metrics is None:
+                                    result.audit_metrics = {}
+                                result.audit_metrics["membership_inference"] = {
+                                    "auc": mia.auc,
+                                    "advantage": mia.advantage,
+                                }
+
+                    # Save synthetic dataset
+                    syn_filename = f"synthetic_{result.name}_eps{eps}_seed{seed}.csv"
+                    syn_filename = syn_filename.replace(" ", "_").replace("/", "_")
+                    syn_path = os.path.join(out_dir, syn_filename)
+                    syn.to_csv(syn_path, index=False)
+                    result.synthetic_data_path = syn_path
+                    print(f"  💾 Saved synthetic data: {syn_filename} ({len(syn)} rows, {syn.shape[1]} columns)")
+
                     all_results.append(result)
-                    continue
-                
-                time_breakdown = f"fit={result.fit_time_sec:.2f}s, sample={result.sample_time_sec:.2f}s"
-                if result.vocab_align_time_sec is not None:
-                    time_breakdown += f", vocab_align={result.vocab_align_time_sec:.2f}s"
-                print(f"✓ Generated in {result.total_time_sec:.2f}s ({time_breakdown}) using {result.peak_memory_mb:.1f} MB")
-                
-                # Compute metrics using eval_real (aligned for Enhanced, original for others)
-                print(f"  Computing utility metrics...")
-                basic_util = compute_basic_utility(eval_real, syn)
-                result.jaccard = basic_util['jaccard']
-                result.weighted_jaccard = basic_util['weighted_jaccard']
-                result.marginal_error = basic_util['marginal_error']
-                print(f"  ✓ Basic: Jaccard={result.jaccard:.3f}, W-Jaccard={result.weighted_jaccard:.3f}")
-                
-                print(f"  Computing comprehensive utility...")
-                # Use provided target column or auto-detect (common names: 'target', 'income', 'label', 'class')
-                detected_target_col = target_col
-                if detected_target_col is None:
-                    for col in ['target', 'income', 'label', 'class', 'outcome']:
-                        if col in eval_real.columns:
-                            detected_target_col = col
-                            break
-                comp_util = compute_comprehensive_utility(
-                    eval_real, syn, target_col=detected_target_col, n_bootstrap=n_bootstrap
-                )
-                result.tvd_metrics = comp_util.get('tvd', {})
-                result.mi_metrics = comp_util.get('mi', {})
-                result.correlation_metrics = comp_util.get('correlation', {})
-                result.coverage_metrics = comp_util.get('coverage', {})
-                result.downstream_metrics = comp_util.get('downstream', {})
-                
-                print(f"  Computing privacy attacks...")
-                privacy_attacks = compute_privacy_attacks(eval_real, syn)
-                result.exact_row_match_rate = privacy_attacks['exact_row_match_rate']
-                result.qi_linkage_rate = privacy_attacks['qi_linkage_rate']
-                if result.exact_row_match_rate is not None:
-                    print(f"  ✓ ERMR={result.exact_row_match_rate:.4f}, QI-Link={result.qi_linkage_rate:.4f}")
-                
-                # Save synthetic dataset
-                syn_filename = f"synthetic_{impl_name}_eps{eps}_seed{seed}.csv"
-                syn_path = os.path.join(out_dir, syn_filename)
-                syn.to_csv(syn_path, index=False)
-                result.synthetic_data_path = syn_path
-                print(f"  💾 Saved synthetic data: {syn_filename} ({len(syn)} rows, {syn.shape[1]} columns)")
-                
-                all_results.append(result)
     
     # Save results
     print(f"\n{'='*80}")
@@ -1170,8 +1735,77 @@ if __name__ == "__main__":
         default=30,
         help="Number of bootstrap resamples for confidence intervals (0 disables).",
     )
+
+    # Minimum viable privacy audit probes
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        default=True,
+        help="Compute additional privacy audit probes (NN memorization, unique/rare leakage, conditional disclosure).",
+    )
+    parser.add_argument(
+        "--no-audit",
+        action="store_false",
+        dest="audit",
+        help="Disable privacy audit probes (use for faster runs).",
+    )
+    parser.add_argument(
+        "--audit-mia",
+        action="store_true",
+        default=True,
+        help="Compute membership inference (distance-based) by training on a train split (extra cost).",
+    )
+    parser.add_argument(
+        "--no-audit-mia",
+        action="store_false",
+        dest="audit_mia",
+        help="Disable membership inference probe (use for faster runs).",
+    )
+    parser.add_argument(
+        "--audit-mia-holdout-frac",
+        type=float,
+        default=0.3,
+        help="Holdout fraction for membership inference (default 0.3).",
+    )
+    parser.add_argument(
+        "--audit-mia-impls",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Subset of implementations to run membership inference for (default: all selected impls).",
+    )
+    parser.add_argument(
+        "--regimes",
+        type=str,
+        nargs="+",
+        default=["default"],
+        choices=["default", "strict"],
+        help="Which configuration regimes to run. Use both to compare default vs strict-DP.",
+    )
+    parser.add_argument(
+        "--dpmm-default-preprocess",
+        type=str,
+        default="none",
+        choices=["none", "public", "dp"],
+        help="DPMM preprocessing mode when regime=default. 'none' is non-DP (data-derived bounds/domains).",
+    )
+    parser.add_argument(
+        "--schema",
+        type=str,
+        default=None,
+        help="Path to per-dataset public-schema JSON (public bounds/categories). Consumed only in regime=default.",
+    )
+    parser.add_argument(
+        "--strict-dp",
+        action="store_true",
+        help="(Deprecated) Alias for --regimes strict.",
+    )
     
     args = parser.parse_args()
+
+    regimes = list(args.regimes or ["default"])
+    if args.strict_dp:
+        regimes = ["strict"]
     
     main(
         args.data,
@@ -1182,6 +1816,13 @@ if __name__ == "__main__":
         args.target_col,
         args.n_samples,
         args.n_bootstrap,
+        args.audit,
+        args.audit_mia,
+        args.audit_mia_holdout_frac,
+        args.audit_mia_impls,
+        regimes,
+        args.dpmm_default_preprocess,
+        args.schema,
     )
 
 

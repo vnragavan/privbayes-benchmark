@@ -1,0 +1,1056 @@
+\documentclass[10pt,conference]{IEEEtran}
+\usepackage[T1]{fontenc} % fixes listings quotes in OT1
+\usepackage{textcomp}    % provides additional text symbols (e.g., quotes)
+\usepackage{amsthm}
+\usepackage{amsmath}
+\usepackage{amssymb} 
+\newtheorem{definition}{Definition}
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{cite}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{listings}
+
+\usepackage[most]{tcolorbox}
+\tcbuselibrary{listings,skins,breakable}
+\usepackage{pifont} 
+% -- Code blocks: colored, margin-safe, with syntax highlighting --
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[most]{tcolorbox}
+\tcbuselibrary{listings,skins,breakable}
+
+% Colors
+\definecolor{codeback}{HTML}{F7F9FC}
+\definecolor{codeframe}{HTML}{D0D7DE}
+\definecolor{codekw}{HTML}{005CC5}
+\definecolor{codestr}{HTML}{9A3B00}
+\definecolor{codecom}{HTML}{6E7781}
+\definecolor{codetitle}{HTML}{EAECEF}
+
+% Listings style for Python (line numbers inside, no clipping)
+\lstdefinestyle{privpy}{
+  language=Python,
+  basicstyle=\ttfamily\footnotesize\linespread{1.05}\selectfont,
+  keywordstyle=\color{codekw}\bfseries,
+  stringstyle=\color{codestr},
+  commentstyle=\color{codecom}\itshape,
+  showstringspaces=false,
+  breaklines=true,
+  tabsize=2,
+  columns=fullflexible,
+  keepspaces=true,
+  upquote=true,
+  numbers=left,
+  numbersep=6pt,
+  framexleftmargin=12pt,  % padding INSIDE the frame for numbers
+  xleftmargin=0pt         % no external margin push
+}
+
+% Reusable colored code box
+\newtcblisting{codeblock}[2][]{%
+  breakable,
+  listing only,
+  enhanced,
+  colback=codeback,
+  colframe=codeframe,
+  boxrule=0.6pt,
+  arc=2pt,
+  top=8pt, bottom=8pt, left=6pt, right=6pt,
+  listing options={style=privpy},
+  title={#2},
+  colbacktitle=codetitle,
+  coltitle=black,
+  fonttitle=\bfseries\footnotesize,
+  attach boxed title to top left={xshift=4pt,yshift=-2pt},
+  #1
+}
+
+% Colored verdict symbols
+\newcommand{\cmark}{{\color{green!60!black}\checkmark}}  % green check
+\newcommand{\xmark}{{\color{red!70!black}\ding{55}}}     % red cross
+\newcommand{\warn}{{\color{orange!90!black}\ding{46}}}   % orange exclamation
+
+\title{Do Popular PrivBayes Implementations Deliver on Differential Privacy?  \\ 
+A Systematic Compliance Audit and Leakage Study}
+
+\author{
+    \IEEEauthorblockN{Author Name}
+    \IEEEauthorblockA{
+        Affiliation \\
+        Email
+    }
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+PrivBayes is a well-known algorithm for generating synthetic tabular data
+under differential privacy (DP). 
+It has inspired a number of open-source implementations used in academic,
+industrial, and policy settings. 
+However, we show that many of these implementations quietly violate the 
+requirements of DP, exposing sensitive information through preprocessing,
+structure learning, and parameter estimation steps. 
+We propose a compliance specification for differentially private PrivBayes,
+develop an audit framework that combines static compliance checks with
+adversarial probes, and empirically evaluate representative implementations.
+Our results demonstrate that non-compliant pipelines achieve utility levels
+that appear ``too good to be true'' at low $\varepsilon$, while simultaneously
+leaking membership and linkage information. 
+We conclude with guidelines and a reproducible framework for certifying
+PrivBayes-style implementations.
+\end{abstract}
+
+\section{Introduction}
+
+The release of synthetic data under differential privacy is an active research area,
+with Bayesian network approaches such as PrivBayes~\cite{zhang2017privbayes}
+serving as canonical baselines. 
+PrivBayes discretizes numeric variables, learns a Bayesian network structure
+with noisy dependence scores, estimates noisy conditional probability tables,
+and samples synthetic data. 
+Its conceptual simplicity and broad applicability have motivated numerous
+open-source implementations, which are increasingly relied upon in
+scientific and policy contexts.
+
+Unfortunately, faithful DP compliance in PrivBayes is subtle.
+Every data-dependent operation from bounds selection to structure learning must
+either be public or consume part of the privacy budget. 
+Violations of these requirements may produce synthetic datasets that are
+claimed to be DP but in fact leak sensitive information. 
+This paper systematically investigates such violations.
+
+Our work makes four main contributions:
+\begin{enumerate}
+  \item We formalize a \emph{DP compliance specification} for PrivBayes-style pipelines,
+  detailing the exact requirements for preprocessing, structure learning,
+  parameter estimation, and privacy accounting.
+  \item We design an \emph{audit framework} that combines (i) a compliance checklist,
+  (ii) adversarial probes for privacy risk (membership inference, linkage,
+  memorization, unique pattern leakage), and (iii) utility probes.
+  \item We conduct an empirical \emph{audit of open-source PrivBayes implementations},
+  identifying common violation patterns and quantifying their impact on
+  privacy risk and utility.
+  \item We release a reproducible \emph{reference implementation} and audit harness,
+  enabling future projects to certify DP compliance in PrivBayes-style pipelines.
+\end{enumerate}
+
+\section{Background}
+\subsection{Differential Privacy}
+Differential privacy (DP)~\cite{dwork2006calibrating,dwork2014algorithmic}
+is the gold standard for formal privacy guarantees.
+Intuitively, DP ensures that the presence or absence of any single individual
+in the dataset has only a limited influence on the output of a randomized mechanism.
+Formally:
+
+\begin{definition}[Differential Privacy]
+A randomized mechanism $\mathcal{M}: \mathcal{D} \to \mathcal{R}$ satisfies
+$(\varepsilon,\delta)$-differential privacy if for any two neighboring datasets
+$D,D' \in \mathcal{D}$ differing in at most one record, and for any
+measurable subset $S \subseteq \mathcal{R}$,
+\begin{equation}
+\Pr[\mathcal{M}(D) \in S] \;\leq\; e^{\varepsilon} \Pr[\mathcal{M}(D') \in S] + \delta.
+\end{equation}
+\end{definition}
+
+The parameter $\varepsilon$ controls the privacy–utility trade-off:
+smaller values yield stronger privacy but more noise. 
+The parameter $\delta$ allows for a small probability of failure,
+typically set to be negligible in $n$, such as $\delta=1/n^2$.
+DP is robust to arbitrary side information and composes gracefully:
+the privacy loss from multiple DP mechanisms adds up under basic composition
+(and more tightly under advanced composition or Rényi DP accounting).
+
+\subsection{Synthetic Data Under DP}
+Synthetic data generation aims to produce a dataset $\widetilde{D}$
+that resembles the real dataset $D$ but satisfies DP guarantees.
+If $\widetilde{D}$ is produced by a DP mechanism $\mathcal{M}$,
+then publishing $\widetilde{D}$ incurs no further privacy loss
+(post-processing immunity). 
+Ensuring DP therefore requires that \emph{all data-dependent steps}
+in the pipeline are either (i) DP mechanisms with explicit accounting,
+or (ii) based on public knowledge.
+
+\subsection{The PrivBayes Algorithm}
+PrivBayes~\cite{zhang2017privbayes} is a canonical algorithm
+for DP synthetic data generation. It constructs a Bayesian network
+to approximate the joint distribution of attributes:
+
+\begin{equation}
+\Pr(X_1,\ldots,X_d) \;=\; \prod_{i=1}^d \Pr(X_i \mid P_i),
+\end{equation}
+
+where $P_i$ denotes the parent set of $X_i$ of bounded size $m$.
+
+The pipeline consists of four stages:
+
+\begin{enumerate}
+    \item \textbf{Discretization and preprocessing.}
+    Numeric attributes require finite bounds and discretization.
+    Bounds must be public or DP-derived; bin counts must be fixed
+    or DP-selected.
+
+    \item \textbf{Structure learning.}
+    For each attribute $X_i$, the parent set $P_i$ is chosen
+    to maximize a noisy dependence score (e.g., mutual information).
+    Selection is performed with the exponential mechanism.
+
+    \item \textbf{Parameter estimation.}
+    Conditional probability tables (CPTs) are estimated from noisy counts.
+    Each count $c(x_i,p_i)$ is perturbed with Laplace or geometric noise
+    calibrated to sensitivity 1 under record-level adjacency:
+    \[
+    \widetilde{c}(x_i,p_i) = c(x_i,p_i) + \mathrm{Lap}(1/\varepsilon_p).
+    \]
+
+    \item \textbf{Sampling.}
+    Synthetic records are generated by ancestral sampling from the BN.
+    This is post-processing and does not consume privacy budget.
+\end{enumerate}
+
+\subsection{Challenges in DP-Compliant Implementation}
+In principle, PrivBayes satisfies DP when each step is implemented correctly
+and the privacy budget is allocated across stages.
+In practice, however, implementations often:
+\begin{itemize}
+    \item Derive bounds from raw min/max without noise,
+    \item Select bins or categories using non-private heuristics,
+    \item Compute structure scores without perturbation,
+    \item Tune hyperparameters directly on private data,
+    \item Misreport or ignore composition of $\varepsilon$ across steps.
+\end{itemize}
+These shortcuts undermine formal privacy guarantees
+and motivate the need for systematic audits.
+\section{Problem Formulation and Threat Model}
+
+\subsection{Research Problem}
+Despite the clear requirements, many open-source implementations
+derive bounds from raw min/max, choose bins via non-DP heuristics,
+or compute structure scores on unnoised counts.
+Such shortcuts undermine DP guarantees.
+
+\paragraph{Problem formulation.}
+Given a claimed $(\varepsilon,\delta)$-DP synthetic release
+\(\widetilde{D}=\mathcal{M}(D)\), our goal is to determine whether the \emph{entire}
+pipeline is DP-compliant, not merely whether it contains DP-like components.
+In particular, we focus on the gap between:
+(i) \emph{strict-DP} configurations in which all data-dependent preprocessing is
+either public or DP-budgeted, and (ii) \emph{default} configurations in which
+unbudgeted data-dependent steps (e.g., raw bounds, private domain discovery)
+may introduce additional leakage.
+
+\paragraph{Research questions.}
+We ask: \emph{How do differences in privacy accounting, preprocessing, and
+mechanism design across PrivBayes implementations affect (a) measured leakage
+risk, (b) utility, and (c) computational performance as $\varepsilon$ varies?}
+Section~\ref{sec:experiments} instantiates this question as RQ1--RQ3.
+
+\subsection{Threat Model}
+\label{sec:threat-model}
+We adopt the standard \emph{record-level} DP threat model.
+Neighboring datasets \(D\) and \(D'\) differ by the addition or removal of a
+single individual record (add/remove, i.e., unbounded adjacency).
+The adversary may possess arbitrary side information (including all but one
+record \(x^\star\) in \(D\)), knows the mechanism \(\mathcal{M}\) and its declared
+parameters \((\varepsilon,\delta)\), and observes the released synthetic dataset
+\(\widetilde{D}\) (and, when applicable, an exported model artifact such as BN
+structure/CPTs). The release is non-interactive: the attacker receives a single
+snapshot \(\widetilde{D}\) and can post-process it arbitrarily.
+
+\paragraph{Implication.}
+If an implementation were truly $(\varepsilon,\delta)$-DP under this adjacency,
+then any attacker, including the membership, linkage, and memorization probes
+considered in Section~\ref{sec:experiments}, would have only bounded advantage
+as a function of \((\varepsilon,\delta)\). Therefore, systematically elevated
+leakage signals at small \(\varepsilon\) are evidence of \emph{non-compliance}
+and/or unaccounted privacy loss.
+
+\section{Methodology: DP Audit Framework}
+
+\subsection{Compliance Specification}
+Let $\mathcal{O}_1,\ldots,\mathcal{O}_T$ be the sequence of
+operations in a PrivBayes pipeline.
+Each $\mathcal{O}_t$ must be either:
+\begin{itemize}
+  \item \emph{Public}, consuming no privacy budget, or
+  \item a \emph{DP mechanism} $\mathcal{M}_t$ with parameters $(\varepsilon_t,\delta_t)$.
+\end{itemize}
+The overall mechanism satisfies
+\begin{equation}
+\sum_{t=1}^{T}\varepsilon_t \leq \varepsilon, \qquad 
+\sum_{t=1}^{T}\delta_t \leq \delta.
+\end{equation}
+
+\subsection{Compliance Checklist}
+Table~\ref{tab:checklist} summarizes requirements.
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{p{0.32\linewidth} p{0.55\linewidth}}
+\toprule
+\textbf{Requirement} & \textbf{Compliance Criterion} \\
+\midrule
+Numeric bounds & Derived via DP quantiles; no raw min/max \\
+Binning & Fixed or DP-selected (exponential mechanism) \\
+Categorical domain & Public schema domain (fixed independently of the private dataset); unseen mapped to \texttt{\_\_UNK\_\_} \\
+Structure learning & Scores from noisy counts; parents via EM \\
+Parameter estimation & Counts noised with sensitivity $1$; normalized \\
+Composition & Explicit budget allocation and accountant trace \\
+Hyperparameter tuning & Public or DP; no raw-data tuning \\
+Logging & No raw stats; only DP or post-processed summaries \\
+\bottomrule
+\end{tabular}
+\caption{Differential privacy compliance checklist for PrivBayes pipelines.}
+\label{tab:checklist}
+\end{table}
+
+\subsection{Adversarial Risk Probes}
+
+Let $D=\{x^{(1)},\ldots,x^{(n)}\}$ be the private dataset over attributes
+$X_1,\ldots,X_d$, and let $\widetilde{D}=\mathcal{M}(D)$ be the synthetic release.
+Let $\mathcal{B}$ denote the Bayesian network (BN) learned from $D$.
+
+\paragraph{BN likelihoods.}
+For a record $x=(x_1,\ldots,x_d)$, the BN likelihood is
+\begin{equation}
+\Pr_{\mathcal{B}}(x) \;=\; \prod_{i=1}^{d} \Pr_{\mathcal{B}}(X_i=x_i \mid P_i(x)),
+\label{eq:bn-lik}
+\end{equation}
+where $P_i(x)$ is the configuration of the parents $P_i$ in $x$.
+We use $\ell_{\mathcal{B}}(x) = \log \Pr_{\mathcal{B}}(x)$ as a per-record score.
+
+\subsubsection{Membership Inference}
+For a target record $x^\star$, define hypotheses
+\[
+H_0: x^\star \notin D
+\qquad\text{vs.}\qquad
+H_1: x^\star \in D.
+\]
+We compute the test statistic
+\begin{equation}
+T(x^\star;\mathcal{B}) \;=\; \ell_{\mathcal{B}}(x^\star) \;-\; 
+\mathbb{E}_{x \sim \pi}[\ell_{\mathcal{B}}(x)],
+\label{eq:mi-stat}
+\end{equation}
+where $\pi$ is a reference distribution (e.g., from a holdout set).
+The decision rule is $\widehat{H}=H_1$ if $T(x^\star;\mathcal{B}) \ge \tau$.
+
+We report:
+\begin{align}
+\mathrm{TPR}(\tau) &= \Pr(\widehat{H}=H_1 \mid H_1), \\
+\mathrm{FPR}(\tau) &= \Pr(\widehat{H}=H_1 \mid H_0), \\
+\mathrm{AUC} &= \int_0^1 \mathrm{TPR}(\mathrm{FPR}^{-1}(u))\,du, \\
+\mathrm{Adv} &= \max_{\tau}\; \bigl[\mathrm{TPR}(\tau) - \mathrm{FPR}(\tau)\bigr].
+\end{align}
+
+\subsubsection{Linkage Attacks on Quasi-Identifiers}
+Let $Q$ index quasi-identifiers and $S$ sensitive attributes.
+Given a registry $\mathcal{R}$ containing $(x_Q,\mathrm{id})$ pairs,
+the attacker seeks re-identification.
+
+Define the candidate set
+\[
+\mathcal{C}(x_Q) = \{ \tilde{x} \in \widetilde{D} : \tilde{x}_Q = x_Q \}.
+\]
+Success indicators are
+\[
+\mathrm{hit}_k(x) = \mathbb{I}\{\text{true $\mathrm{id}(x)$ in top-$k$ of $\mathcal{C}(x_Q)$}\}.
+\]
+We report
+\begin{equation}
+\mathrm{Hit@}k = \frac{1}{|D|}\sum_{x \in D} \mathrm{hit}_k(x),
+\end{equation}
+and conditional disclosure leakage
+\begin{equation}
+\Delta_{\mathrm{cond}}(Q,S) = 
+\mathbb{E}_{x \in D}\Bigl[
+\bigl|
+\Pr_{\widetilde{D}}(X_S \mid X_Q=x_Q) - \Pr_{D}(X_S \mid X_Q=x_Q)
+\bigr|
+\Bigr].
+\end{equation}
+
+\subsubsection{Nearest-Neighbor Memorization}
+Let $\mathrm{dist}$ be Hamming distance.
+For each $x \in D$,
+\[
+d_{\mathrm{syn}}(x) = \min_{\tilde{x}\in \widetilde{D}} \mathrm{dist}(x,\tilde{x}), \quad
+d_{\mathrm{real}}(x) = \min_{y \in D\setminus\{x\}} \mathrm{dist}(x,y).
+\]
+The excess-match indicator is
+\[
+\mathrm{EM}(x) = \mathbb{I}\{d_{\mathrm{syn}}(x) < d_{\mathrm{real}}(x)\},
+\]
+and the memorization rate is
+\begin{equation}
+\mathrm{EMR} = \frac{1}{|D|}\sum_{x \in D} \mathrm{EM}(x).
+\end{equation}
+
+\subsubsection{Unique Pattern Leakage}
+For a pattern $\pi$ on attributes $A$,
+let $\mathrm{supp}_D(\pi)$ and $\mathrm{supp}_{\widetilde{D}}(\pi)$ be supports.
+The leakage is
+\begin{equation}
+\mathrm{UPL}(A) =
+\frac{1}{|D|}
+\Bigl|\{x \in D: \mathrm{supp}_D(x_A)=1 \wedge \mathrm{supp}_{\widetilde{D}}(x_A)\ge 1\}\Bigr|.
+\end{equation}
+
+\subsubsection{Rare-Combination Leakage}
+For contingency cells $c$ with rare counts $0 < C_D(c) \le \tau$,
+define
+\begin{equation}
+\mathrm{RMR}_\tau = \frac{1}{|\mathcal{C}_\tau|}\sum_{c \in \mathcal{C}_\tau} \mathbb{I}\{C_{\widetilde{D}}(c) \ge 1\},
+\end{equation}
+and
+\begin{equation}
+\mathrm{MAE}_\tau = \frac{1}{|\mathcal{C}_\tau|}\sum_{c \in \mathcal{C}_\tau} |C_{\widetilde{D}}(c)-C_D(c)|.
+\end{equation}
+
+\subsection{Utility Metrics}
+We evaluate
+\begin{equation}
+\mathrm{TV@1} = \frac{1}{|\mathcal{M}_1|}\sum_{M \in \mathcal{M}_1}\mathrm{TV}(P_D^M,P_{\widetilde{D}}^M), 
+\quad
+\mathrm{TV@2} = \frac{1}{|\mathcal{M}_2|}\sum_{M \in \mathcal{M}_2}\mathrm{TV}(P_D^M,P_{\widetilde{D}}^M),
+\end{equation}
+where $\mathcal{M}_1$ and $\mathcal{M}_2$ are one- and two-way marginals.
+Downstream accuracy is measured by training classifiers on $\widetilde{D}$ 
+and evaluating on a real test set.
+\section{Case Study: Compliance Audit of SynthCity's \texttt{PrivBayes}}
+
+We apply our audit framework to the open-source \texttt{PrivBayes} implementation shipped with SynthCity.
+For each checklist item, we show the observed behavior, the corresponding code excerpt, and why it violates DP.
+
+\subsection{Numeric Bounds and Discretization}
+
+\textbf{Observed behavior.} Continuous attributes are discretized with \verb|pd.cut| using data-derived min/max;
+the decision to treat a column as categorical vs.\ continuous also depends on the private number of unique values.
+
+\begin{codeblock}[label={lst:synthcity-encode}]{Bounds and discretization via \texttt{\_encode}}
+def _encode(self, data: pd.DataFrame) -> Any:
+    data = data.copy()
+    encoders = {}
+    for col in data.columns:
+        if len(data[col].unique()) < self.n_bins or data[col].dtype.name not in [
+            "object", "category",
+        ]:
+            encoders[col] = {
+                "type": "categorical",
+                "model": LabelEncoder().fit(data[col]),
+            }
+            data[col] = encoders[col]["model"].transform(data[col])
+        else:
+            col_data = pd.cut(data[col], bins=self.n_bins)
+            encoders[col] = {
+                "type": "continuous",
+                "model": LabelEncoder().fit(col_data),
+            }
+            data[col] = encoders[col]["model"].transform(col_data)
+    return data, encoders
+\end{codeblock}
+
+\textbf{Violation.} Both min/max bounds and bin edges are learned directly from private data (non-DP).
+The \verb|len(unique)| gate is also data-dependent. DP requires public bounds or DP-derived quantiles and
+either fixed binning or DP model selection.
+
+\subsection{Categorical Domain Handling}
+
+\textbf{Observed behavior.} Categorical domains are inferred from private categories and label-encoded.
+
+\begin{codeblock}[label={lst:synthcity-cat}]{Categorical labeling in \texttt{\_encode}}
+encoders[col] = {"type": "categorical", "model": LabelEncoder().fit(data[col])}
+data[col] = encoders[col]["model"].transform(data[col])
+\end{codeblock}
+
+\textbf{Violation.} The category domain is data-derived. For an end-to-end DP claim, categorical domains must be treated as \emph{public schema} metadata (fixed independently of the private dataset); otherwise the pipeline leaks which categories appear.
+
+\subsection{Structure Learning}
+
+\textbf{Observed behavior.} Parent sets are scored by a mutual information proxy computed from raw data using KMeans on parents
+and \verb|pd.cut| on the target; an exponential-mechanism-like sampler then selects parents using a sensitivity bound that assumes
+closed-form MI on discrete variables.
+
+\begin{codeblock}[label={lst:synthcity-mi}]{Mutual information scoring from raw data}
+def mutual_info_score(self, data: pd.DataFrame, parents: List[str], candidate: str) -> float:
+    if len(parents) == 0:
+        return 0
+    src = data[parents]
+    src_cluster = KMeans(n_clusters=10).fit(src)
+    src_bins = src_cluster.predict(src)
+    target = data[candidate]
+    target_bins, _ = pd.cut(target, bins=self.n_bins, retbins=True)
+    target_bins = LabelEncoder().fit_transform(target_bins)
+    return normalized_mutual_info_score(src_bins, target_bins)
+\end{codeblock}
+
+\begin{codeblock}[label={lst:synthcity-em}]{Exponential-mechanism-like weighting}
+def _exponential_mechanism(self, data, parents_pair_list, mutual_info_list):
+    delta_array = []
+    for (candidate, parents) in parents_pair_list:
+        sensitivity = self._calculate_sensitivity(data, candidate, parents)
+        delta = self._calculate_delta(data, sensitivity)
+        delta_array.append(delta)
+    mi_array = np.array(mutual_info_list) / (2 * np.array(delta_array))
+    mi_array = np.exp(mi_array)
+    mi_array = self._normalize_given_distribution(mi_array)
+    return mi_array
+\end{codeblock}
+
+\textbf{Violation.} The utility $u$ is computed via non-DP KMeans + \verb|pd.cut|, so no valid global sensitivity bound applies.
+Using EM weights with a mis-specified sensitivity does not restore DP. Additionally, using a data-dependent threshold \verb|mi_thresh|
+to zero out parents is another unbudgeted data-dependent operation.
+
+\subsection{Hyperparameter Selection (\texorpdfstring{$K$}{K})}
+
+\textbf{Observed behavior.} The maximum parent count $K$ is solved from a usefulness equation that depends on dataset size and attributes.
+
+\begin{codeblock}[label={lst:synthcity-K}]{Data-driven $K$ via \texttt{\_compute\_K}}
+def _compute_K(self, data: pd.DataFrame) -> int:
+    num_tuples, num_attributes = data.shape
+    initial_usefulness = usefulness_minus_target(self.default_k, num_attributes, num_tuples, 0, self.epsilon)
+    if initial_usefulness > self.target_usefulness:
+        return self.default_k
+    arguments = (num_attributes, num_tuples, self.target_usefulness, self.epsilon)
+    try:
+        ans = fsolve(usefulness_minus_target, np.array([int(num_attributes / 2)]), args=arguments)[0]
+        ans = ceil(ans)
+    except RuntimeWarning:
+        ans = self.default_k
+    if ans < 1 or ans > num_attributes:
+        ans = self.default_k
+    return ans
+\end{codeblock}
+
+\textbf{Violation.} $K$ is tuned on private $n$ and $d$ without a DP mechanism or budget accounting.
+
+\subsection{Parameter Estimation (Noisy Counts)}
+
+\textbf{Observed behavior.} Laplace noise is added to counts with scale proportional to $1/n$ (via \texttt{\_laplace\_noise\_parameter}).
+
+\begin{codeblock}[label={lst:synthcity-noisy}]{Noisy counts with scale $\propto 1/n$}
+def _get_noisy_counts_for_attributes(self, raw_data: pd.DataFrame, attributes: list) -> pd.DataFrame:
+    data = raw_data.copy().loc[:, attributes]
+    stats = data.groupby(attributes).size().reset_index().rename(columns={0: "count"})
+    noise_para = self._laplace_noise_parameter(*raw_data.shape)  # 2*(d-K)/(n * epsilon')
+    laplace_noises = np.random.laplace(0, scale=noise_para, size=stats.index.size)
+    stats["count"] += laplace_noises
+    stats.loc[stats["count"] < 0, "count"] = 0
+    return stats
+\end{codeblock}
+
+\textbf{Violation.} For counting queries, $\ell_1$ sensitivity is 1 regardless of $n$.
+Laplace scale must be $1/\varepsilon_{\text{counts}}$ (or a composed split). Scale $\propto 1/n$
+vanishes as $n$ grows, eliminating privacy.
+
+\subsection{Privacy Accounting}
+
+\textbf{Observed behavior.} $\varepsilon$ is halved in the constructor and reused implicitly across steps.
+
+\begin{codeblock}[label={lst:synthcity-budget}]{Implicit budget split}
+def __init__(self, epsilon: float = 1.0, ...):
+    # eps1 = eps/2 (structure), eps2 = eps/2 (parameters)
+    self.epsilon = epsilon / 2
+\end{codeblock}
+
+\textbf{Violation.} No explicit per-step ledger or composition accountant is provided; since structure learning is not DP,
+the claimed split does not yield a valid $(\varepsilon,\delta)$ guarantee.
+
+\begin{table}[t]
+\centering
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{p{0.28\linewidth} p{0.45\linewidth} p{0.18\linewidth}}
+\toprule
+\textbf{Checklist Item} & \textbf{Observed in SynthCity \texttt{PrivBayes}} & \textbf{Verdict} \\
+\midrule
+Numeric bounds / binning 
+& Uses \verb|pd.cut| with data-derived min/max; decision based on \verb|len(unique)| & \xmark~Non-DP \\
+
+Categorical domain 
+& Categories inferred with \verb|LabelEncoder.fit(data)| & \xmark~Non-DP \\
+
+Structure learning 
+& MI via KMeans + \verb|pd.cut| on raw data; EM with mis-specified sensitivity; thresholding with \verb|mi\_thresh| & \xmark~Non-DP \\
+
+Max parents $K$ 
+& Computed from private $n$ and $d$ using usefulness equation (\verb|_compute_K|) & \xmark~Non-DP \\
+
+Parameter estimation 
+& Laplace scale $\propto 1/n$; noise vanishes as $n$ grows & \xmark~Non-DP \\
+
+Privacy accounting 
+& Simply halves $\varepsilon$; no explicit ledger or composition & \warn~Insufficient \\
+
+Logging / post-processing 
+& Logs raw MI and edges; normalizes CPTs post-noise & \warn~Risky logging \\
+\bottomrule
+\end{tabular}
+\caption{Audit of SynthCity's \texttt{PrivBayes} against the DP compliance checklist.
+\xmark = non-DP, \warn = partial or unsafe, \cmark = DP-compliant.}
+\label{tab:synthcity-audit}
+\end{table}
+
+\begin{table*}[t]
+\centering
+\scriptsize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{p{0.28\linewidth} p{0.36\linewidth} c c c}
+\toprule
+\textbf{Checklist item} & \textbf{DP-compliant criterion (mechanism-agnostic)} & \textbf{Enhanced (strict-DP)} & \textbf{SynthCity (default)} & \textbf{DPMM (dpmm)} \\
+\midrule
+
+Numeric bounds (metadata)
+& Bounds are public or DP-released (e.g., DP quantiles / DP bounds); no raw min/max
+& \cmark & \xmark & \warn \\
+
+Binning / discretization
+& Discretization is fixed/public or derived only from DP metadata (post-processing)
+& \cmark & \xmark & \warn \\
+
+Categorical domain
+& Public domain (schema), no raw \texttt{unique()}-based domain inference
+& \cmark & \xmark & \warn \\
+
+Structure utilities
+& Dependence scores computed only from DP measurements (or otherwise DP-proved)
+& \cmark & \xmark & \warn \\
+
+Parent selection
+& DP selection (e.g., exponential mechanism with correct sensitivity) or post-processing of DP scores
+& \warn & \xmark & \warn \\
+
+Parameter estimation
+& Parameters learned only from DP measurements (Laplace/Geometric/Gaussian under valid accountant), then normalised (post-processing)
+& \cmark & \xmark & \warn \\
+
+Composition / accounting
+& Explicit budget split and accounting trace (or clearly specified zCDP/RDP conversion)
+& \cmark & \warn & \warn \\
+
+Non-private preprocessing / schema decisions
+& No data-dependent type switches, thresholds, or tuning unless public or DP-budgeted
+& \warn & \xmark & \warn \\
+
+Logging
+& No raw data-dependent statistics emitted; only DP summaries or post-processing
+& \cmark & \warn & \warn \\
+
+\bottomrule
+\end{tabular}
+\caption{Three-way DP compliance comparison against the checklist in Table~\ref{tab:checklist}.
+\cmark = compliant, \warn = conditional/partial (configuration- or proof-dependent), \xmark = non-compliant.
+For \textbf{Enhanced}, we report the strict-DP configuration intended to satisfy the checklist by construction.
+SynthCity is reported in its default configuration as audited in Table~\ref{tab:synthcity-audit}.}
+\label{tab:threeway-audit}
+\end{table*}
+\section{Reference Design: Compliance With the DP Checklist}
+\label{sec:ref-design-compliance}
+
+We summarize how our reference PrivBayes implementation satisfies each
+requirement in the compliance checklist (Table~\ref{tab:ref-design-checklist}).
+At a high level, the pipeline partitions the privacy budget
+$\varepsilon = \varepsilon_{\mathrm{disc}} + \varepsilon_{\mathrm{struct}} + \varepsilon_{\mathrm{cpt}}$
+(and $\delta$ if smooth sensitivity is used) and ensures that every
+data-dependent step is either (i) a differentially private mechanism with explicit
+parameters and sensitivity calibration, or (ii) pure post-processing.
+
+\paragraph{Adjacency and sensitivity}
+We adopt add/remove (unbounded) adjacency, so the $\ell_1$ sensitivity of any
+cell count is $1$. All count queries therefore add Laplace noise with scale
+$b = 1/\varepsilon$ per query (or per cell when split across cells).
+
+\paragraph{DP metadata (numeric) and public schema (categorical)}
+For numeric columns, we use \emph{smooth sensitivity} quantiles
+(Nissim–Raskhodnikova–Smith) to release DP bounds:
+for the $\alpha$ and $(1-\alpha)$ quantiles, we compute a smooth upper bound
+$S^\star$ on local sensitivity and release
+\[
+\tilde{q} \;=\; q(x) \;+\; \mathrm{Laplace}\!\Big(\tfrac{2 S^\star}{\varepsilon_q}\Big),
+\]
+splitting $\varepsilon_{\mathrm{disc}}$ (and $\delta$) evenly between the two quantiles.
+We never clamp to private min/max; optional clamping to coarse \emph{public}
+bounds is permitted.
+For categorical columns, our current benchmarked strict configuration assumes a
+\emph{public schema} domain; unseen values are mapped to a catch-all
+\texttt{\_\_UNK\_\_} token as post-processing. We do not implement DP categorical
+domain discovery in the current code.
+Numeric discretization uses fixed bin counts on the DP bounds (post-processing).
+
+\paragraph{Structure learning}
+Mutual information (MI) utilities are computed \emph{only} from DP joint counts:
+for each pair $(X,Y)$ we form a contingency table with Laplace$(1/\varepsilon_{\mathrm{pair}})$
+noise per cell, convert to a probability table, and then compute MI as
+post-processing. Parent selection for each node takes the top utilities
+(or optionally uses the exponential mechanism calibrated by the same DP counts),
+thereby avoiding direct calibration on non-private scores.
+
+\paragraph{Parameter estimation (CPTs)}
+Conditional tables are estimated from DP counts:
+each CPT row receives independent $\mathrm{Laplace}(1/\varepsilon_{\mathrm{var}})$
+noise per cell, counts are clipped at $0$ with small additive smoothing, and
+rows are normalized. $\varepsilon_{\mathrm{cpt}}$ is divided across variables.
+
+\paragraph{Composition and ledger}
+We maintain an explicit budget split
+$(\varepsilon_{\mathrm{disc}}, \varepsilon_{\mathrm{struct}}, \varepsilon_{\mathrm{cpt}})$,
+track any $(\varepsilon,\delta)$ spend for smooth bounds, and \emph{do not} fold
+unused $\varepsilon_{\mathrm{disc}}$ back into the main budget. A
+\texttt{privacy\_report()} sidecar records adjacency, splits, and whether DP
+metadata was actually used.
+
+\paragraph{Tuning and logging}
+Heuristics (e.g., bins, max parents) depend only on configuration, $(n,d)$, and
+$\varepsilon$; no raw statistics are logged or released. If dataset size $n$
+is considered sensitive in a deployment, one can either (i) treat $n$ as public
+schema metadata (common), or (ii) replace it by a public upper bound or a
+negligible DP release; our implementation does not release $n$.
+
+\begin{table}[t]
+\centering
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{p{0.34\linewidth} p{0.57\linewidth} c}
+\toprule
+\textbf{Checklist item} & \textbf{Reference design behavior} & \textbf{Status} \\
+\midrule
+Numeric bounds & Smooth-sensitivity DP quantiles for $(\alpha,1-\alpha)$; no private clamping; optional clamp to coarse \emph{public} box. & \cmark \\
+Binning & Fixed bin counts on DP bounds (pure post-processing). & \cmark \\
+Categorical domain & Public schema domains + \texttt{\_\_UNK\_\_} for unseen; bounded alphabet. & \cmark \\
+Structure utilities & MI computed from \emph{DP joint counts}; selection by top-$u$ or EM over these DP utilities. & \cmark \\
+Sensitivity use & Count sensitivity $=1$ under add/remove; Laplace scales $1/\varepsilon$ per cell; no ad-hoc rescaling. & \cmark \\
+CPT estimation & Laplace$(1/\varepsilon_{\mathrm{var}})$ to CPT counts, clip $\ge 0$, smooth, normalize per row. & \cmark \\
+Composition & Explicit split $(\varepsilon_{\mathrm{disc}},\varepsilon_{\mathrm{struct}},\varepsilon_{\mathrm{cpt}})$; $\delta$ tracked for smooth bounds; no fold-back of $\varepsilon_{\mathrm{disc}}$. & \cmark \\
+Hyperparameter tuning & Heuristics depend only on $(n,d,\varepsilon)$; no raw statistics; can fix $n$ to public bound if needed. & \cmark \\
+Logging & Privacy ledger only (\texttt{privacy\_report}); no raw min/max, no raw MI, no unnoised counts. & \cmark \\
+Adjacency & Add/remove (unbounded) explicitly recorded; sensitivity and noise calibrated accordingly. & \cmark \\
+\bottomrule
+\end{tabular}
+\caption{Compliance of the reference PrivBayes design with our DP checklist.}
+\label{tab:ref-design-checklist}
+\end{table}
+
+\paragraph{Edge cases and safeguards.}
+Degenerate columns (all missing/constant) fall back to benign defaults and are
+flagged; categorical discovery is disabled unless $\varepsilon_{\mathrm{disc}}>0$
+(or a public domain is provided); and \texttt{strict\_dp} prevents non-DP
+fallbacks. Together, these safeguards ensure the released model and synthetic
+data are post-processing of well-defined DP mechanisms with auditable accounting.
+
+
+\section{Experimental Evaluation}
+\label{sec:experiments}
+
+Our empirical study complements the static compliance analysis in
+Sections~\ref{sec:ref-design-compliance}--\ref{tab:threeway-audit} by measuring
+\emph{observed} leakage and utility across implementations.
+The core experimental idea is to demonstrate that pipelines which are
+\emph{not} end-to-end DP-compliant can achieve utility that appears
+``too good to be true'' at small $\varepsilon$, while simultaneously exhibiting
+elevated linkage and membership risks.
+
+\subsection{Research Questions}
+\label{sec:rqs}
+We evaluate three research questions:
+\begin{itemize}
+    \item \textbf{RQ1 (Leakage under default pipelines).} Do popular open-source
+    implementations of PrivBayes exhibit measurable leakage signals (membership,
+    linkage, memorization) when run in their default configurations?
+    \item \textbf{RQ2 (Effect of DP-compliant preprocessing).} How much of the
+    privacy risk in default pipelines is attributable to \emph{non-private}
+    preprocessing decisions (e.g., raw min/max bounds, data-derived categorical
+    domains), as opposed to the DP mechanism itself?
+    \item \textbf{RQ3 (Utility--privacy--performance trade-offs).} How do the
+    proposed \textbf{Enhanced} method and baseline implementations trade off
+    utility, leakage risk, and computational cost as $\varepsilon$ varies?
+\end{itemize}
+
+\subsection{Datasets}
+\label{sec:datasets}
+We use two standard tabular datasets and one real-world clinical dataset:
+\begin{itemize}
+    \item \textbf{Adult (Census Income).} Mixed categorical/numeric attributes with
+    target \texttt{income}. This dataset is challenging for DP pipelines due to
+    heterogeneous domains and rare category combinations.
+    \item \textbf{Breast Cancer (Diagnostic).} Primarily numeric attributes with
+    binary target \texttt{target}. This setting emphasizes distance-based
+    memorization and nearest-neighbor style leakage signals.
+    \item \textbf{Lung Cancer (Real-world clinical dataset).} A de-identified
+    real-world tabular dataset containing demographic and clinical attributes and
+    a task-specific outcome label. This dataset stresses practical deployment
+    conditions: mixed types, missingness, and rare combinations that can
+    exacerbate linkage and membership risks when preprocessing is not DP-budgeted.
+\end{itemize}
+Unless otherwise stated, we generate the same number of synthetic rows as the
+training data (\(|\widetilde{D}|=|D|\)).
+
+\subsection{Mechanisms and Implementations}
+\label{sec:mechanisms}
+We compare:
+\begin{itemize}
+    \item \textbf{Enhanced (Proposed).} Our reference design implementation, intended
+    to satisfy the DP checklist by construction via DP-safe metadata handling,
+    explicit budget splits, and a privacy ledger (\texttt{privacy\_report}).
+    \item \textbf{SynthCity PrivBayes (Baseline).} The PrivBayes implementation shipped
+    with SynthCity; our case study in Section~\ref{sec:ref-design-compliance} identifies
+    multiple checklist violations (e.g., data-derived discretization and domains).
+    \item \textbf{DPMM/\texttt{dpmm} PrivBayes (Baseline).} A commonly used implementation
+    that requires discretization and categorical encoding; DP compliance depends on
+    whether preprocessing uses public/DP-released metadata versus private inference.
+\end{itemize}
+
+\subsection{Configurations: ``Default'' vs.\ ``Strict-DP''}
+\label{sec:configs}
+For each mechanism we distinguish two regimes:
+\begin{itemize}
+    \item \textbf{Default (implementation defaults).} We run each library's standard
+    configuration as provided, which may include data-dependent preprocessing (e.g.,
+    raw min/max bounds, data-derived categorical domains) and incomplete accounting.
+    \item \textbf{Strict-DP (DP-claimed).} We enable DP-safe preprocessing and
+    explicit accounting wherever supported:
+    numeric bounds are derived via DP quantiles (no raw min/max), and categorical
+    domains are treated as \emph{public schema} metadata; unseen values map to a
+    catch-all \texttt{\_\_UNK\_\_} token as post-processing. Any non-DP fallback is disabled.
+\end{itemize}
+\paragraph{What ``default'' means in our benchmarks.}
+Because the literature often uses ``default'' ambiguously, we make the following
+mechanism-specific choices explicit.
+
+\begin{table}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{2.0cm} p{2.9cm} p{2.9cm}}
+\toprule
+\textbf{Mechanism} & \textbf{Default (as run)} & \textbf{Strict-DP (as run)} \\
+\midrule
+\textbf{Enhanced} &
+\begin{tabular}[t]{@{}p{2.9cm}@{}}
+Use schema bounds and domains when provided; otherwise may infer bounds or label support from data (not DP-claimable).
+\end{tabular}
+&
+\begin{tabular}[t]{@{}p{2.9cm}@{}}
+DP numeric bounds discovery for numeric columns; categorical domains may be taken from a public schema; no non-DP fallbacks; label domain must be public (no data-derived class support).
+\end{tabular}
+\\
+\textbf{DPMM/\texttt{dpmm}} &
+\begin{tabular}[t]{@{}p{2.9cm}@{}}
+\texttt{preprocess=none} for discretization and encoding (private metadata, not DP-claimable).
+\end{tabular}
+&
+\begin{tabular}[t]{@{}p{2.9cm}@{}}
+\texttt{preprocess=dp} numeric bounds (DP quantile style) plus fixed-bin discretization; categorical domains must be public.
+\end{tabular}
+\\
+\textbf{SynthCity} &
+\begin{tabular}[t]{@{}p{2.9cm}@{}}
+Default configuration only (library implementation).
+\end{tabular}
+&
+\begin{tabular}[t]{@{}p{2.9cm}@{}}
+Not reported (strict regime skipped, not end-to-end DP interpretable).
+\end{tabular}
+\\
+\bottomrule
+\end{tabular}
+\caption{Operational definition of ``default'' and ``strict-DP'' in our benchmark runner.}
+\label{tab:configs-default-strict}
+\end{table}
+
+\begin{table*}[t]
+\centering
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{p{2.6cm} p{3.35cm} p{3.35cm} p{3.35cm} p{3.35cm}}
+\toprule
+& \multicolumn{2}{c}{\textbf{Enhanced (Proposed)}} & \multicolumn{2}{c}{\textbf{DPMM/\texttt{dpmm} (Baseline)}} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+\textbf{Configuration item} & \textbf{Default} & \textbf{Strict-DP} & \textbf{Default} & \textbf{Strict-DP} \\
+\midrule
+Numeric bounds used for discretization
+& Public schema bounds if \texttt{--schema} provided; otherwise data-derived min/max with margin (not DP-claimable).
+& DP bounds discovery enabled (bounds not taken from schema; bounds are DP-released inside the mechanism).
+& Controlled by \texttt{--dpmm-default-preprocess}. With \texttt{none}, bounds are data-derived (not DP-claimable). With \texttt{public}, use schema bounds.
+& DP numeric bounds release (DP quantile style) plus fixed-bin discretization as post-processing.
+\\
+Categorical domains (non-label)
+& Public schema domains if provided; otherwise the Enhanced mechanism may bucket or treat unseen categories via \texttt{\_\_UNK\_\_} post-processing, but any data-derived domain discovery is not DP-claimable.
+& Public schema domains may be used; no non-DP domain inference; unseen values map to \texttt{\_\_UNK\_\_}. (DP categorical domain discovery is not used in our current code.)
+& With \texttt{preprocess=none}, categories can be inferred privately; with \texttt{public}, domains must be supplied from schema.
+& Requires public categorical domains (Adult uses a fixed UCI Adult public schema); strict mode refuses private domain inference.
+\\
+Label (target) domain
+& If absent from schema, label support may be inferred from data (not DP-claimable).
+& Must be public (e.g., Adult \texttt{income}\(\in\{\)\texttt{<=50K, >50K}\(\}\), Breast \texttt{target}\(\in\{\)\texttt{0,1}\(\}\)); strict mode errors otherwise.
+& Treated as any other categorical in default preprocessing.
+& Must be included in public categorical domains when strict mode is enabled.
+\\
+Preprocessing mode flag
+& N/A (Enhanced controls this internally based on regime and schema availability).
+& N/A (Enhanced controls this internally based on regime).
+& \texttt{--dpmm-default-preprocess none|public|dp}
+& Forced to DP preprocessing regardless of the default flag.
+\\
+\bottomrule
+\end{tabular}
+\caption{Explicit configuration contract for default vs.\ strict-DP regimes (as implemented in our benchmark runner) for Enhanced and DPMM.}
+\label{tab:enhanced-dpmm-configs}
+\end{table*}
+
+\textbf{Enhanced (Proposed).}
+In \emph{default} mode, Enhanced uses a \emph{public schema} file (when provided)
+for numeric bounds and categorical domains; if schema metadata are absent, it
+falls back to private, data-derived bounds or domains, which is a checklist
+violation under DP claims. In \emph{strict-DP} mode, Enhanced enables DP bounds
+discovery (spending part of \(\varepsilon\) inside the mechanism) and forbids
+non-DP fallbacks. Labels are treated specially: strict-DP requires a public
+label domain (e.g., \texttt{income} for Adult, \texttt{target} for Breast Cancer)
+so that class support is not inferred from private data.
+
+\textbf{DPMM/\texttt{dpmm} (Baseline).}
+In \emph{default} mode, we run DPMM with \texttt{preprocess=none}, meaning that
+numeric discretization and any category encoding are performed with private,
+data-derived metadata. This configuration is useful for leakage diagnosis but
+should not be advertised as end-to-end DP. In \emph{strict-DP} mode, we enforce
+DP-safe preprocessing: numeric bounds are released with a DP quantile-style
+mechanism and discretization uses fixed bins as post-processing, while
+categorical columns require public domains (for Adult we use the standard UCI
+Adult schema). If public domains are not available, strict mode disables
+non-private inference rather than silently proceeding.
+
+Concretely, \textbf{Enhanced} in strict-DP mode enables DP bounds discovery and
+requires a public label domain, while \textbf{DPMM} in strict-DP mode enforces
+public categorical domains (Adult) and DP discretization for numeric columns.
+\textbf{SynthCity} is reported only in its default configuration, since our audit
+does not support interpreting its $\varepsilon$ knob as an end-to-end DP guarantee.
+
+\paragraph{Reproducible mapping to code flags.}
+All runs are produced by our benchmark runner with the following regime controls:
+\begin{itemize}
+    \item \texttt{--regimes default strict} runs both regimes; strict mode may skip mechanisms that are not DP-claimable.
+    \item \texttt{--schema <path>} provides the public schema (bounds and domains) used by default-mode Enhanced, and by default-mode DPMM when \texttt{--dpmm-default-preprocess public} is selected.
+    \item \texttt{--dpmm-default-preprocess none|public|dp} selects DPMM preprocessing in the default regime; strict regime forces DP preprocessing.
+\end{itemize}
+
+\subsection{Privacy Budgets and Randomization}
+\label{sec:budgets}
+We sweep \(\varepsilon \in \{0.1,\,0.5,\,1.0,\,3.0,\,5.0\}\). We set
+\(\delta = 1/n^2\) where \(n=|D|\), consistent with the threat model in
+Section~\ref{sec:threat-model}. We repeat each \((\text{implementation},\varepsilon)\)
+setting across multiple random seeds and report uncertainty via confidence
+intervals over seeds.
+
+\subsection{Metrics and Plots}
+\label{sec:metrics-plots}
+We report three families of metrics:
+\begin{itemize}
+    \item \textbf{Utility/Fidelity.} Overlap-based similarity (Jaccard and weighted
+    Jaccard), marginal error, and distributional fidelity (TVD/EMD over low-order
+    marginals, correlation and MI preservation where applicable), plus downstream
+    task performance by training on \(\widetilde{D}\) and evaluating on real data.
+    \item \textbf{Privacy leakage probes.} QI linkage rate, nearest-neighbor
+    memorization (EMR), unique/rare pattern leakage, conditional disclosure
+    leakage, and (optionally) membership inference AUC/advantage.
+    \item \textbf{Performance.} Fit time, sampling time, total runtime, and peak
+    memory.
+\end{itemize}
+Figures are organized as (i) a multi-panel utility/fidelity summary, (ii) a
+multi-panel privacy/leakage summary, (iii) a performance summary, and (iv) a
+utility--privacy trade-off plot (e.g., weighted Jaccard vs.\ QI linkage) that
+highlights ``too-good-to-be-true'' behavior in non-compliant pipelines.
+
+\subsection{Reproducibility}
+\label{sec:repro}
+All experiments are produced by a single benchmark runner that executes the
+Cartesian product of \((\varepsilon,\text{seed},\text{implementation})\) and writes
+machine-readable JSON outputs, including per-run \texttt{privacy\_report} where
+available. A separate plotting script aggregates results across seeds and renders
+the figures described above, ensuring the paper's plots are directly traceable to
+auditable artifacts.
+
+\section{Discussion: How Practitioners Can Use These Results}
+\label{sec:discussion}
+This paper is motivated by a practical problem: real deployments rarely begin
+with a formal DP proof of an open-source synthesizer. Instead, practitioners
+must decide whether a pipeline is safe enough to use, how to configure it, and
+how to communicate privacy claims to stakeholders. We summarize concrete
+guidelines for using our checklist and empirical probes in a deployment workflow.
+
+\subsection{A practitioner workflow for ``DP synthetic data''}
+\label{sec:practitioner-workflow}
+We recommend the following steps before releasing synthetic data from a private
+table:
+\begin{enumerate}
+    \item \textbf{Fix the threat model and adjacency.} Decide record-level vs.
+    user-level privacy, add/remove vs.\ substitute adjacency, and a target
+    \((\varepsilon,\delta)\). State these explicitly (Section~\ref{sec:threat-model}).
+    \item \textbf{Validate compliance by construction.} Use the checklist
+    (Table~\ref{tab:checklist}) to ensure every data-dependent step is either
+    (i) public, or (ii) DP with an auditable accounting trace. In particular:
+    (a) numeric bounds must not be raw min/max; (b) categorical domains must be
+    public schema metadata (no private domain discovery); and
+    (c) any hyperparameter selection must not depend on raw statistics.
+    \item \textbf{Require a privacy ledger.} Treat a machine-readable
+    \texttt{privacy\_report()} as part of the release artifact: it should record
+    adjacency, \((\varepsilon,\delta)\), and any budget splits used for
+    discretization, structure learning, and CPT estimation.
+    \item \textbf{Run adversarial probes as a pre-release gate.} Even if the
+    implementation claims DP, measure leakage indicators (membership, linkage,
+    memorization, rare/unique pattern leakage). These probes are not proofs, but
+    they are effective at detecting unbudgeted data-dependent preprocessing and
+    ``DP in name only'' configurations.
+    \item \textbf{Report uncertainty and stability.} Repeat across seeds and
+    report confidence intervals. In practice, unstable leakage curves (large
+    seed variance) are a red flag for brittle mechanisms and should trigger
+    configuration hardening (e.g., stronger discretization, smaller parent sets).
+\end{enumerate}
+
+\subsection{Interpreting ``too good to be true'' at small \texorpdfstring{$\varepsilon$}{epsilon}}
+\label{sec:too-good}
+Practitioners often evaluate synthesizers primarily by utility metrics. Our
+results suggest a sharper diagnostic: if a mechanism achieves unusually strong
+utility at very small \(\varepsilon\) \emph{and} simultaneously exhibits elevated
+QI linkage, nearest-neighbor memorization, or membership advantage, then the
+most plausible explanation is that the effective privacy loss is larger than the
+declared \(\varepsilon\) due to non-compliant preprocessing or accounting gaps.
+In that case, treating the release as $(\varepsilon,\delta)$-DP is not justified.
+
+\subsection{What to do when an implementation is non-compliant}
+\label{sec:noncompliant-actions}
+When a baseline implementation fails checklist items, practitioners have three
+options:
+\begin{itemize}
+    \item \textbf{Reconfigure into strict-DP mode.} Replace data-derived bounds
+    with DP bounds; replace private domain inference with public schema metadata
+    and enforce ``no non-DP fallbacks'' (strict mode).
+    \item \textbf{Downgrade the claim.} If strict-DP is not supported, do not
+    market the release as DP. Use alternative governance (access controls,
+    contractual restrictions) and treat privacy metrics as empirical only.
+    \item \textbf{Switch mechanisms.} Prefer implementations that expose an
+    explicit accounting trace and can be audited end-to-end (e.g., our Enhanced
+    reference design).
+\end{itemize}
+
+\subsection{Release checklist for papers and production reports}
+\label{sec:release-checklist}
+To reduce ambiguity in both scientific and operational settings, we recommend
+including the following in any synthetic data release report:
+\begin{itemize}
+    \item \textbf{Threat model:} adjacency definition; attacker observation (synthetic only vs.\ model sidecar).
+    \item \textbf{Budgets:} \((\varepsilon,\delta)\) and all splits/composition assumptions.
+    \item \textbf{Metadata:} which bounds/domains were public, DP-released, or inferred (and therefore non-compliant).
+    \item \textbf{Stability:} seeds, confidence intervals, and failure/degeneracy modes.
+    \item \textbf{Leakage probes:} at minimum linkage + NN memorization + one membership-style test.
+    \item \textbf{Artifacts:} machine-readable outputs (JSON) and a privacy ledger (\texttt{privacy\_report}).
+\end{itemize}
+
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

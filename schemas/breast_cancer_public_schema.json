@@ -1,0 +1,137 @@
+{
+  "dataset": "breast_cancer",
+  "target_col": "target",
+  "label_domain": [
+    "0",
+    "1"
+  ],
+  "public_bounds": {
+    "mean radius": [
+      5.92455,
+      29.166449999999998
+    ],
+    "mean texture": [
+      8.2315,
+      40.7585
+    ],
+    "mean perimeter": [
+      36.5545,
+      195.7355
+    ],
+    "mean area": [
+      25.625,
+      2618.875
+    ],
+    "mean smoothness": [
+      0.0470915,
+      0.1689385
+    ],
+    "mean compactness": [
+      0.003079000000000002,
+      0.361701
+    ],
+    "mean concavity": [
+      -0.02134,
+      0.44814000000000004
+    ],
+    "mean concave points": [
+      -0.01006,
+      0.21126
+    ],
+    "mean symmetry": [
+      0.09609999999999999,
+      0.3139
+    ],
+    "mean fractal dimension": [
+      0.047585999999999996,
+      0.099814
+    ],
+    "radius error": [
+      -0.02657500000000003,
+      3.0110750000000004
+    ],
+    "texture error": [
+      0.13396000000000002,
+      5.11124
+    ],
+    "perimeter error": [
+      -0.30415000000000003,
+      23.041150000000002
+    ],
+    "area error": [
+      -19.967900000000004,
+      568.9699
+    ],
+    "smoothness error": [
+      0.0002421499999999998,
+      0.03260085
+    ],
+    "compactness error": [
+      -0.0044054,
+      0.1420574
+    ],
+    "concavity error": [
+      -0.0198,
+      0.4158
+    ],
+    "concave points error": [
+      -0.0026395,
+      0.0554295
+    ],
+    "symmetry error": [
+      0.0043286,
+      0.0825034
+    ],
+    "fractal dimension error": [
+      -0.00055246,
+      0.03128726
+    ],
+    "worst radius": [
+      6.5245,
+      37.445499999999996
+    ],
+    "worst texture": [
+      10.144,
+      51.416
+    ],
+    "worst perimeter": [
+      40.37049999999999,
+      261.23949999999996
+    ],
+    "worst area": [
+      -18.240000000000038,
+      4457.44
+    ],
+    "worst smoothness": [
+      0.0635985,
+      0.2301715
+    ],
+    "worst compactness": [
+      -0.024245500000000007,
+      1.1095355
+    ],
+    "worst concavity": [
+      -0.0626,
+      1.3146
+    ],
+    "worst concave points": [
+      -0.01455,
+      0.30555
+    ],
+    "worst symmetry": [
+      0.131135,
+      0.6891649999999999
+    ],
+    "worst fractal dimension": [
+      0.047417,
+      0.21512299999999998
+    ]
+  },
+  "public_categories": {
+    "target": [
+      "0",
+      "1"
+    ]
+  }
+}
+

@@ -38,11 +38,16 @@ privbayes-benchmark/
 ├── data/
 │   ├── adult.csv              # Adult dataset for benchmarking
 │   └── breast_cancer.csv      # (Optional) generated medical dataset for testing
+├── schemas/                   # Per-dataset public schema JSONs (public knowledge simulation)
+│   ├── adult_public_schema.json
+│   ├── breast_cancer_public_schema.json
+│   └── README.md
 ├── external/
 │   └── privbayes_enhanced.py  # Enhanced PrivBayes implementation
 ├── src/
 │   └── pbbench/
 │       ├── enhanced_metrics.py      # Comprehensive metrics module
+│       ├── privacy_audit.py         # Minimum viable audit probes
 │       └── variants/
 │           ├── pb_enhanced.py        # Enhanced PrivBayes adapter
 │           ├── pb_synthcity.py       # SynthCity PrivBayes adapter
@@ -53,10 +58,20 @@ privbayes-benchmark/
 │   ├── validate_metrics_json.py            # Sanity-check metrics JSON structure/ranges
 │   ├── verify_install.py                   # Verify environment + imports + datasets
 │   ├── prepare_breast_cancer_dataset.py    # Generate data/breast_cancer.csv from sklearn
-│   └── augment_results_json_with_downstream.py  # (Optional) recompute/inject downstream metrics into an existing JSON
+│   └── internal/                           # Legacy/debug helpers (not needed for typical runs)
+├── docs/                      # Project docs (structure, workflows, results layout)
+│   ├── PROJECT_STRUCTURE.md
+│   ├── WORKFLOWS.md
+│   └── RESULTS_AND_PLOTS.md
 ├── requirements.txt
 └── README.md
 ```
+
+See:
+- `docs/PROJECT_STRUCTURE.md`
+- `docs/WORKFLOWS.md`
+- `docs/RESULTS_AND_PLOTS.md`
+- `scripts/README.md`
 
 ## Installation
 
@@ -71,6 +86,13 @@ cd privbayes-benchmark
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
+```
+
+Optional (recommended for development): install the package in editable mode, so imports work
+without `sys.path` manipulation:
+
+```bash
+python -m pip install -e .
 ```
 
 3. Verify your installation (recommended):
@@ -145,7 +167,7 @@ python scripts/comprehensive_comparison.py \
     --data data/adult.csv \
     --eps 0.5 1.0 2.0 \
     --seeds 0 1 2 \
-    --out-dir results \
+    --out-dir runs/example_adult \
     --implementations Enhanced SynthCity DPMM
 ```
 
@@ -285,6 +307,33 @@ python scripts/plot_utility_privacy_from_json.py results_dir --prefix my_plots
 python scripts/plot_utility_privacy_from_json.py results_dir --prefix my_plots_ci95 --uncertainty ci95
 ```
 
+## Recommended “paper runs” workflow
+
+Use the orchestrator which runs Adult + Breast Cancer across regimes and generates split figures:
+
+```bash
+python scripts/run_paper_experiments.py
+```
+
+Notes:
+- `--audit` and `--audit-mia` are **enabled by default**.
+- Use `--no-audit` and/or `--no-audit-mia` for faster iterations.
+- `--split` is **enabled by default**. Use `--no-split` to disable.
+- By default it runs **5 seeds** (`--seeds 0 1 2 3 4`). Override with `--seeds ...` if desired.
+
+Examples:
+
+```bash
+# Explicit 5-seed run (same as default)
+python scripts/run_paper_experiments.py --seeds 0 1 2 3 4
+
+# Faster iteration: keep audit probes, disable MIA
+python scripts/run_paper_experiments.py --no-audit-mia
+
+# Change epsilon sweep
+python scripts/run_paper_experiments.py --eps 0.1 1 3 5
+```
+
 Uncertainty modes:
 - `--uncertainty none`: no error bars
 - `--uncertainty se`: mean ± standard error across seeds/runs
@@ -298,6 +347,18 @@ The dataset should be a CSV file with:
   - Common names: `target`, `income`, `label`, `class`, `outcome`
 
 The included `adult.csv` dataset is preprocessed and ready to use.
+
+## Per-dataset schema files (public knowledge)
+
+Some configurations model **public side information** about a dataset (e.g., numeric ranges and
+categorical domains). We represent this as a **per-dataset schema JSON** consumed by the runner:
+
+```bash
+python scripts/comprehensive_comparison.py --data data/adult.csv --schema schemas/adult_public_schema.json ...
+```
+
+Schema files live under `schemas/`. See `schemas/README.md` for the expected format and validation
+commands.
 
 ## Metrics Explained
 

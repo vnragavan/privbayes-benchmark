@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+INTERNAL / LEGACY
+
 Augment an existing comprehensive_results_*.json with downstream metrics.
 
 Useful when older results have missing downstream metrics (e.g., DPMM label collapse),
@@ -7,9 +9,9 @@ and you want consistent plotting without re-running synthesis.
 
 Example:
   source .venv/bin/activate
-  PYTHONPATH=src python scripts/augment_results_json_with_downstream.py \
+  python scripts/internal/augment_results_json_with_downstream.py \
     --real data/breast_cancer.csv \
-    --results medical_breast_cancer_all3_torch241/comprehensive_results_20260211_140819.json \
+    --results <results_dir>/comprehensive_results_*.json \
     --target-col target
 """
 
@@ -20,8 +22,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from pbbench.enhanced_metrics import comprehensive_downstream_metrics
 

@@ -1,0 +1,172 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{siunitx}
+\usepackage{hyperref}
+\usepackage{microtype}
+
+\title{Benchmarking Differentially Private PrivBayes Variants on a Medical Classification Dataset}
+\author{(Draft) privbayes-benchmark}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We benchmark three implementations of a PrivBayes-style differentially private (DP) tabular synthesizer---\textbf{Enhanced}, \textbf{SynthCity}, and \textbf{DPMM}---on a medical classification dataset derived from the UCI Breast Cancer Wisconsin diagnostic dataset.
+We evaluate utility (set-based similarity, mutual information preservation, distributional distances, correlation preservation, and downstream ML performance), privacy (QI linkage rate; exact row match rate), and performance (runtime and memory).
+Across five random seeds and privacy budgets \(\varepsilon \in \{0.1, 0.5, 1.0, 3.0, 5.0\}\), we observe substantial trade-offs: SynthCity achieves markedly higher similarity-based utility but at very high memory cost, while Enhanced is orders-of-magnitude faster with minimal memory footprint but substantially lower similarity-based utility; privacy leakage via QI linkage is similar across mechanisms in this dataset.
+\end{abstract}
+
+\section{Introduction}
+Synthetic data generation under DP aims to enable data sharing and analysis while bounding privacy risk.
+PrivBayes-style models synthesize tabular data by learning a Bayesian network structure (under DP) and sampling from a noisy factorization.
+Despite conceptual similarity, practical implementations can differ significantly in their preprocessing, discretization, optimization, and engineering choices, leading to large differences in utility, privacy, and performance.
+This paper reports a reproducible benchmark using the \texttt{privbayes-benchmark} pipeline and summarizes conclusions for a medical classification task.
+
+\section{Methods}
+\subsection{Mechanisms}
+We evaluate three mechanisms exposed by the benchmark:
+\begin{itemize}
+  \item \textbf{Enhanced}: a lightweight optimized PrivBayes implementation.
+  \item \textbf{SynthCity}: PrivBayes via the \texttt{synthcity} library.
+  \item \textbf{DPMM}: a PrivBayes variant provided by the \texttt{dpmm} package.
+\end{itemize}
+
+\subsection{Privacy budgets and randomness}
+Each mechanism is run at privacy budgets \(\varepsilon \in \{0.1, 0.5, 1.0, 3.0, 5.0\}\), using \textbf{5} random seeds per \((\text{mechanism}, \varepsilon)\) pair.
+All plots show the \textbf{mean} across seeds.
+Uncertainty bands are plotted as a normal-approximation 95\% confidence interval:
+\[
+\bar{x} \pm 1.96 \cdot \mathrm{SE}, \quad \mathrm{SE}=\frac{s}{\sqrt{n}}, \; n=5.
+\]
+(\emph{Note}: with \(n=5\), a \(t\)-interval is also reasonable; we use the same convention as the plotting script.)
+
+\subsection{Dataset}
+We use a CSV export of the Breast Cancer Wisconsin diagnostic dataset with a binary target label (\texttt{target}).
+The benchmark treats the dataset as tabular and computes both statistical similarity metrics and downstream ML performance.
+
+\subsection{Metrics}
+\paragraph{Utility.}
+The 9-panel figure reports: Weighted Jaccard similarity, privacy-budget efficiency (utility per \(\varepsilon\)), mutual information preservation, distributional distances (TVD for 1D/2D/3D marginals; EMD), correlation preservation (Pearson/Spearman matrix agreement), and downstream ML AUC (Syn\(\rightarrow\)Real) for Logistic Regression (LR) and Random Forest (RF).
+
+\paragraph{Privacy.}
+We report QI linkage rate (lower is better). Exact row match rate (ERMR) is also computed but is constant at \(\textbf{0}\) across all runs here.
+
+\paragraph{Performance.}
+We report total runtime, plus any available fit/sample time breakdown, and peak memory.
+
+\section{Experimental Results}
+\subsection{Figures}
+Figure~\ref{fig:utility_privacy} summarizes utility, privacy, and selected performance measures across \(\varepsilon\).
+Figure~\ref{fig:performance} breaks out performance into four panels.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{medical_breast_cancer_trend_eps_seeds5/trend_eps_seeds5_ci95_v5_pubtitle.pdf}
+  \caption{Utility, privacy, and performance summary across privacy budgets \(\varepsilon \in \{0.1,0.5,1.0,3.0,5.0\}\) (mean across 5 seeds; error bars are 95\% CI). Panels (a)--(i) are discussed in Section~\ref{sec:panelwise}.}
+  \label{fig:utility_privacy}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\textwidth]{medical_breast_cancer_trend_eps_seeds5/trend_eps_seeds5_ci95_v5_pubtitle_performance.pdf}
+  \caption{Performance breakdown (mean across 5 seeds; 95\% CI): total time, fit time, sample time, and peak memory vs \(\varepsilon\). Panels (a)--(d).}
+  \label{fig:performance}
+\end{figure}
+
+\subsection{Panel-by-panel analysis and conclusions}
+\label{sec:panelwise}
+
+Below we interpret each panel in Figure~\ref{fig:utility_privacy}, then discuss Figure~\ref{fig:performance}.
+When we cite representative numbers, they are computed from the same JSON used to create the figures (5 seeds per setting).
+
+\subsubsection*{Panel (a): Utility vs privacy budget (Weighted Jaccard; higher is better)}
+SynthCity achieves substantially higher Weighted Jaccard than the other mechanisms across all \(\varepsilon\) values.
+For example, at \(\varepsilon=1.0\), SynthCity is approximately \(0.472 \pm 0.001\) (95\% CI), while Enhanced is \(0.0181 \pm 0.0004\), and DPMM is \(0.0135 \pm 0.0019\).
+\textbf{Conclusion:} on this dataset and metric, SynthCity is the clear utility leader, whereas Enhanced and DPMM are far lower and close to each other.
+
+\subsubsection*{Panel (b): Privacy-budget efficiency (utility per \(\varepsilon\); higher is better)}
+Because SynthCity dominates absolute utility, it also dominates utility-per-\(\varepsilon\) for most \(\varepsilon\) values.
+\textbf{Conclusion:} increasing \(\varepsilon\) does not yield comparable improvements for Enhanced/DPMM under this particular similarity metric; their efficiency curves are relatively flat and low.
+
+\subsubsection*{Panel (c): QI linkage rate (lower is better; ERMR note)}
+ERMR is constant at \(0\) for all mechanisms and all budgets, indicating no exact row matches between real and synthetic rows in these runs.
+QI linkage rates are broadly similar across mechanisms and do not show a strong monotonic decrease with \(\varepsilon\) in this dataset.
+Representative values at \(\varepsilon=1.0\) are \(\approx 0.376\)--\(0.385\) across mechanisms (with overlapping 95\% CIs).
+\textbf{Conclusion:} within this evaluation, privacy risk as captured by QI linkage is comparable across implementations; utility differences are not accompanied by large linkage differences.
+
+\subsubsection*{Panel (d): Total time vs \(\varepsilon\) (log scale; lower is better)}
+Enhanced is orders of magnitude faster than SynthCity and DPMM (sub-second total time vs hundreds to thousands of seconds).
+DPMM and SynthCity show large run-to-run variability in total time, especially at small \(\varepsilon\) (e.g., DPMM at \(\varepsilon=0.1\) has a very wide CI due to heavy-tailed runtimes).
+\textbf{Conclusion:} Enhanced is the performance leader by runtime; SynthCity and DPMM incur substantial compute cost in this benchmark.
+
+\subsubsection*{Panel (e): Utility--privacy tradeoff (Weighted Jaccard vs QI linkage; \(\varepsilon\) trajectory)}
+This panel plots \textbf{utility} (y-axis) against \textbf{QI linkage} (x-axis), connecting points in increasing \(\varepsilon\) order for each mechanism.
+Because QI linkage is similar across mechanisms while utility differs sharply, SynthCity occupies a higher-utility region with comparable linkage.
+\textbf{Conclusion:} for these settings, the mechanisms differ far more in utility than in linkage, and SynthCity offers a better observed utility--linkage operating point (at substantial system cost; see Figure~\ref{fig:performance}).
+
+\subsubsection*{Panel (f): Mutual information preservation (higher is better)}
+MI preservation trends capture whether pairwise dependence structure is retained.
+If SynthCity maintains high utility, it is typically consistent with higher dependence preservation, though MI curves may be less separated than Weighted Jaccard depending on discretization and binning effects.
+\textbf{Conclusion:} MI preservation complements similarity metrics and helps diagnose whether utility gains reflect structural fidelity rather than chance overlap.
+
+\subsubsection*{Panel (g): TVD/EMD (log scale; lower is better)}
+TVD (1D/2D/3D) summarizes distributional mismatch at increasing marginal dimensionality; 3D TVD is typically the hardest.
+A mechanism can achieve high similarity on one metric while still exhibiting higher-order distributional drift, which this panel reveals.
+\textbf{Conclusion:} distributional distances provide a stricter view of fidelity than Jaccard-like similarity and should be interpreted jointly with Panels 1 and 6.
+
+\subsubsection*{Panel (h): Correlation preservation (higher is better)}
+This panel evaluates how well correlation structure is preserved (Pearson and Spearman agreement between real and synthetic correlation matrices).
+\textbf{Conclusion:} correlation preservation is important for downstream modeling and feature interactions; a mechanism with high utility but poor correlation preservation may still underperform on predictive tasks.
+
+\subsubsection*{Panel (i): Downstream ML (Syn\(\rightarrow\)Real AUC; higher is better)}
+Downstream AUC measures whether synthetic training data supports predictive models that generalize to the real test distribution.
+On this benchmark, downstream AUCs can have wide uncertainty (reflecting sensitivity to seed, preprocessing, and the synthetic label distribution), especially for DPMM and Enhanced.
+For example, at \(\varepsilon=1.0\), SynthCity achieves LR AUC \(\approx 0.711 \pm 0.057\) and RF AUC \(\approx 0.654 \pm 0.062\), while other mechanisms have lower means and/or wider intervals.
+\textbf{Conclusion:} SynthCity tends to yield stronger downstream performance at moderate \(\varepsilon\), but uncertainty can be large; increasing the number of seeds would tighten intervals and support stronger claims.
+
+\subsection{Performance figure interpretation (Figure~\ref{fig:performance})}
+\paragraph{Total time.}
+Enhanced is consistently sub-second, while SynthCity and DPMM are on the order of minutes to hours across settings.
+
+\paragraph{Fit vs sample time.}
+If fit/sample breakdowns are present, they help attribute cost (e.g., expensive structure learning vs sampling).
+
+\paragraph{Peak memory.}
+SynthCity exhibits extremely high memory usage in this environment (tens of GB), while Enhanced is low (tens of MB) and DPMM is very low (single-digit MB).
+\textbf{Conclusion:} mechanism choice is constrained not only by privacy/utility but by practical resource limits; SynthCity may be infeasible on modest hardware without careful configuration.
+
+\section{Limitations and recommended next steps}
+\begin{itemize}
+  \item \textbf{Small-\(n\) uncertainty:} with 5 seeds, CIs can be noisy; repeating with 20+ seeds or using \(t\)-intervals would strengthen inferential claims.
+  \item \textbf{Metric sensitivity:} similarity metrics depend on discretization and feature handling; reporting additional task-specific metrics can clarify what ``utility'' means for the intended use.
+  \item \textbf{Hardware dependence:} runtime/memory are hardware- and library-version-dependent; pin and report environment details when comparing across machines.
+\end{itemize}
+
+\section{Overall conclusions}
+On the Breast Cancer dataset under the benchmark’s metric suite:
+\begin{itemize}
+  \item \textbf{Utility:} SynthCity achieves the highest similarity-based utility and often strong downstream AUC at moderate \(\varepsilon\).
+  \item \textbf{Privacy (observed):} QI linkage is similar across mechanisms here; ERMR is \(0\) throughout.
+  \item \textbf{Performance:} Enhanced is dramatically faster and memory-efficient; SynthCity is memory-intensive; DPMM is slow but memory-light.
+\end{itemize}
+These results suggest that practical deployment depends on whether one prioritizes raw fidelity (SynthCity) versus lightweight generation (Enhanced), and whether available hardware can support high-memory synthesis.
+
+\begin{thebibliography}{9}
+\bibitem{privbayes}
+Zhang, J., Cormode, G., Procopiuc, C.~M., Srivastava, D., and Xiao, X.
+\newblock PrivBayes: Private Data Release via Bayesian Networks.
+\newblock \emph{SIGMOD}, 2014.
+
+\bibitem{synthcity}
+Qian, Z. \emph{et al.}
+\newblock SynthCity: A benchmark framework for tabular synthetic data generation.
+\newblock (Software library; see \url{https://github.com/vanderschaarlab/synthcity}.)
+\end{thebibliography}
+
+\end{document}
+
