@@ -40,6 +40,14 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     ap.add_argument("--out-root", type=Path, default=Path("paper_runs"))
     ap.add_argument("--n-bootstrap", type=int, default=0, help="Bootstrap resamples inside metrics (0 disables).")
+    ap.add_argument(
+        "--regimes",
+        type=str,
+        nargs="+",
+        choices=["default", "strict"],
+        default=["default", "strict"],
+        help="Which regimes to run per dataset (default: run both to compare).",
+    )
     ap.add_argument("--audit", action="store_true", default=True, help="Enable minimum viable audit probes (default: on).")
     ap.add_argument("--no-audit", action="store_false", dest="audit", help="Disable minimum viable audit probes.")
     ap.add_argument("--audit-mia", action="store_true", default=True, help="Enable membership inference probe (default: on).")
@@ -54,16 +62,34 @@ def main() -> None:
         default=["Enhanced", "SynthCity", "DPMM"],
         help="Base implementations to run.",
     )
+    ap.add_argument(
+        "--datasets",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=["adult", "breast_cancer", "lung_cancer"],
+        metavar="DATASET",
+        help="Which datasets to run (default: adult + breast_cancer; add lung_cancer if --lung set).",
+    )
     args = ap.parse_args()
 
     args.out_root.mkdir(parents=True, exist_ok=True)
 
-    datasets: list[tuple[str, Path, str | None, Path | None]] = [
+    all_datasets: list[tuple[str, Path, str | None, Path | None]] = [
         ("adult", args.adult, "income", args.adult_schema),
         ("breast_cancer", args.breast, "target", args.breast_schema),
     ]
     if args.lung is not None:
-        datasets.append(("lung_cancer", args.lung, args.lung_target_col, args.lung_schema))
+        all_datasets.append(("lung_cancer", args.lung, args.lung_target_col, args.lung_schema))
+
+    if args.datasets is not None:
+        want = set(args.datasets)
+        datasets = [t for t in all_datasets if t[0] in want]
+        if not datasets:
+            print("Error: --datasets did not match any configured dataset.", file=sys.stderr)
+            sys.exit(1)
+    else:
+        datasets = all_datasets
 
     for tag, path, target_col, schema in datasets:
         out_dir = args.out_root / f"{tag}_epsweep_seeds{len(args.seeds)}"
@@ -83,8 +109,7 @@ def main() -> None:
             "--implementations",
             *args.implementations,
             "--regimes",
-            "default",
-            "strict",
+            *args.regimes,
             "--dpmm-default-preprocess",
             "none",
             "--n-bootstrap",
@@ -108,6 +133,7 @@ def main() -> None:
             f"paper_{tag}",
             "--uncertainty",
             args.uncertainty,
+            "--tables",
         ]
         if args.split:
             plot_cmd += ["--split"]

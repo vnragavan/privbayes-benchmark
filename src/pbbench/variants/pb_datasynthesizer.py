@@ -41,6 +41,7 @@ class DPMMPrivBayesAdapter:
         dp_quantile_alpha: float = 0.01,
         public_bounds: Optional[dict] = None,  # {col: [L, U]} or {"*": [L, U]}
         public_categories: Optional[dict] = None,  # {col: [cat1, cat2, ...]}
+        column_types: Optional[dict] = None,  # {col: "continuous"|"integer"|"categorical"|"ordinal"}
         strict_dp: bool = True,
         int_cardinality_as_categorical: int = 20,
         **kwargs
@@ -89,6 +90,7 @@ class DPMMPrivBayesAdapter:
 
         self.public_bounds = dict(public_bounds or {})
         self.public_categories = {k: list(v or []) for k, v in (public_categories or {}).items()}
+        self.column_types = {str(k): str(v).strip().lower() for k, v in (column_types or {}).items()}
         self.dp_quantile_alpha = float(dp_quantile_alpha)
         self.int_cardinality_as_categorical = int(int_cardinality_as_categorical)
 
@@ -196,6 +198,16 @@ class DPMMPrivBayesAdapter:
         # Discretize all data to integers (DPMM requirement)
         X_disc = X.copy()
         for col in X_disc.columns:
+            # If schema explicitly marks a column as categorical/ordinal, treat it as discrete domain.
+            # This is particularly important for ordered integer codes (e.g., Adult education-num).
+            ct = self.column_types.get(str(col))
+            if ct in {"categorical", "ordinal"}:
+                if is_numeric_dtype(X[col]):
+                    kind = self._numeric_discrete_kind(X[col]) or "float"
+                    self._cat_decode_numeric[col] = kind
+                X_disc[col] = self._encode_categorical_col(X[col], col)
+                continue
+
             if is_numeric_dtype(X_disc[col]):
                 # Treat small-cardinality integer-like numerics as categorical.
                 # This preserves discrete labels (e.g., 0/1 target) rather than decoding
@@ -436,6 +448,7 @@ def build_model(config: dict):
         dp_quantile_alpha=config.get("dp_quantile_alpha", 0.01),
         public_bounds=config.get("public_bounds"),
         public_categories=config.get("public_categories"),
+        column_types=config.get("column_types"),
         strict_dp=config.get("strict_dp", True),
     )
 

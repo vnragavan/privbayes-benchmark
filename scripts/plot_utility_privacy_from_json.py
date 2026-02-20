@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 
@@ -294,6 +295,11 @@ def main() -> None:
         help="Add uncertainty bands across seeds/runs per (implementation, epsilon): none|se|ci95.",
     )
     ap.add_argument(
+        "--tables",
+        action="store_true",
+        help="Also write summary tables (CSV + LaTeX) for clutter-prone panels (e.g., downstream ML).",
+    )
+    ap.add_argument(
         "--numeric-first",
         action="store_true",
         default=None,
@@ -424,6 +430,91 @@ def main() -> None:
             va="bottom",
         )
 
+    def _annotate_missing_lines(
+        ax: Any,
+        a_metric: pd.DataFrame,
+        impls_in_order: list[str],
+        *,
+        value_col: str = "mean",
+        loc: tuple[float, float] = (0.02, 0.10),
+        fontsize: int = 9,
+        max_list: int = 4,
+    ) -> None:
+        """Annotate when some implementations have all-NaN values (no line drawn)."""
+        if a_metric.empty or value_col not in a_metric.columns:
+            return
+        missing: list[str] = []
+        for impl in impls_in_order:
+            d = a_metric[a_metric["implementation"] == impl]
+            v = pd.to_numeric(d[value_col], errors="coerce")
+            if not v.notna().any():
+                missing.append(impl)
+        if not missing:
+            return
+        show = missing[:max_list]
+        more = len(missing) - len(show)
+        suffix = f" (+{more} more)" if more > 0 else ""
+        msg = "Note: no values (NaN) for: " + ", ".join(show) + suffix
+        ax.text(
+            loc[0],
+            loc[1],
+            msg,
+            transform=ax.transAxes,
+            fontsize=fontsize,
+            ha="left",
+            va="bottom",
+            bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.75, edgecolor="none"),
+        )
+
+    def _annotate_overlapping_lines(
+        ax: Any,
+        a_metric: pd.DataFrame,
+        impls_in_order: list[str],
+        *,
+        value_col: str = "mean",
+        tol: float = 1e-8,
+        loc: tuple[float, float] = (0.02, 0.92),
+        fontsize: int = 9,
+    ) -> None:
+        """Annotate when curves overlap (nearly identical across implementations)."""
+        if a_metric.empty or value_col not in a_metric.columns:
+            return
+        try:
+            sub = a_metric[a_metric["implementation"].isin(impls_in_order)].copy()
+            sub = sub.dropna(subset=["epsilon", value_col])
+            if sub.empty:
+                return
+            piv = sub.pivot_table(index="epsilon", columns="implementation", values=value_col, aggfunc="first")
+            if piv.shape[1] < 2:
+                return
+            spread = (piv.max(axis=1) - piv.min(axis=1)).max()
+            if pd.notna(spread) and float(spread) <= float(tol):
+                v = float(piv.stack().iloc[0])
+                ax.text(
+                    loc[0],
+                    loc[1],
+                    f"Note: curves overlap (≈{v:.3g} for all mechanisms)",
+                    transform=ax.transAxes,
+                    fontsize=fontsize,
+                    ha="left",
+                    va="top",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.75, edgecolor="none"),
+                )
+        except Exception:
+            return
+
+    def _coverage_count(a_metric: pd.DataFrame, impls_in_order: list[str], *, value_col: str = "mean") -> int:
+        """Count implementations with any non-NaN values for this metric."""
+        if a_metric.empty or value_col not in a_metric.columns:
+            return 0
+        k = 0
+        for impl in impls_in_order:
+            d = a_metric[a_metric["implementation"] == impl]
+            v = pd.to_numeric(d[value_col], errors="coerce")
+            if v.notna().any():
+                k += 1
+        return k
+
     base_colors = {"SynthCity": "#2ca02c", "DPMM": "#d62728", "Enhanced": "#9467bd"}
     colors = {impl: (base_colors.get(_base_impl(impl)) or "#333333") for impl in impls}
 
@@ -476,6 +567,175 @@ def main() -> None:
 
     # If split mode requested, write three focused figures.
     if args.split:
+        def _escape_tex(s: str) -> str:
+            return (
+                str(s)
+                .replace("\\", "\\textbackslash{}")
+                .replace("_", "\\_")
+                .replace("%", "\\%")
+                .replace("&", "\\&")
+                .replace("#", "\\#")
+            )
+
+        def _fmt_cell(mean: Any, err: Any) -> str:
+            try:
+                m = float(mean)
+            except Exception:
+                return ""
+            if not np.isfinite(m):
+                return ""
+            if args.uncertainty == "none":
+                return f"{m:.3f}"
+            try:
+                e = float(err)
+            except Exception:
+                e = float("nan")
+            if np.isfinite(e) and e > 0:
+                return f"{m:.3f} ± {e:.3f}"
+            return f"{m:.3f}"
+
+        def _write_downstream_tables() -> None:
+            """
+            Write downstream ML tables (LR/RF AUC) as CSV and LaTeX.
+            Uses already-aggregated a_lr/a_rf which include uncertainty bands.
+            """
+            # Long CSV
+            lr = a_lr.rename(columns={"mean": "lr_mean", "err_high": "lr_err"}).copy()
+            rf = a_rf.rename(columns={"mean": "rf_mean", "err_high": "rf_err"}).copy()
+            keep = ["implementation", "epsilon"]
+            lr = lr[keep + ["lr_mean", "lr_err"]]
+            rf = rf[keep + ["rf_mean", "rf_err"]]
+            long = lr.merge(rf, on=keep, how="outer").sort_values(["epsilon", "implementation"])
+            long_csv = out_dir / f"{args.prefix}_downstream_long.csv"
+            long.to_csv(long_csv, index=False)
+
+            # Wide (per-epsilon rows, per-impl columns)
+            eps = sorted(pd.to_numeric(long["epsilon"], errors="coerce").dropna().unique().tolist())
+            cols = ["epsilon"] + [f"{impl} (LR)" for impl in impls] + [f"{impl} (RF)" for impl in impls]
+            wide_rows = []
+            for e in eps:
+                row: dict[str, Any] = {"epsilon": e}
+                for impl in impls:
+                    sub = long[(long["implementation"] == impl) & (pd.to_numeric(long["epsilon"], errors="coerce") == e)]
+                    if not sub.empty:
+                        r0 = sub.iloc[0]
+                        row[f"{impl} (LR)"] = _fmt_cell(r0.get("lr_mean"), r0.get("lr_err"))
+                        row[f"{impl} (RF)"] = _fmt_cell(r0.get("rf_mean"), r0.get("rf_err"))
+                    else:
+                        row[f"{impl} (LR)"] = ""
+                        row[f"{impl} (RF)"] = ""
+                wide_rows.append(row)
+            wide = pd.DataFrame(wide_rows, columns=cols)
+            wide_csv = out_dir / f"{args.prefix}_downstream_wide.csv"
+            wide.to_csv(wide_csv, index=False)
+
+            # LaTeX table (wide)
+            tex_path = out_dir / f"{args.prefix}_downstream_table.tex"
+            tex_cols = "l" + ("c" * (len(cols) - 1))
+            header = " & ".join([_escape_tex(c) for c in cols]) + " \\\\"
+            lines = []
+            lines.append("% Auto-generated by plot_utility_privacy_from_json.py --tables")
+            lines.append("\\begin{table*}[t]")
+            lines.append("\\centering")
+            lines.append("\\scriptsize")
+            lines.append("\\setlength{\\tabcolsep}{3pt}")
+            lines.append("\\resizebox{\\linewidth}{!}{%")
+            lines.append(f"\\begin{{tabular}}{{{tex_cols}}}")
+            lines.append("\\toprule")
+            lines.append(header)
+            lines.append("\\midrule")
+            for _, r in wide.iterrows():
+                vals = [r.get("epsilon")]
+                try:
+                    vals[0] = f"{float(vals[0]):g}"
+                except Exception:
+                    vals[0] = str(vals[0])
+                for c in cols[1:]:
+                    vals.append(str(r.get(c) or ""))
+                lines.append(" & ".join([_escape_tex(v) for v in vals]) + " \\\\")
+            lines.append("\\bottomrule")
+            lines.append("\\end{tabular}%")
+            lines.append("}")
+            lines.append("\\caption{Downstream ML performance (AUC) across $\\varepsilon$ (mean and uncertainty).}")
+            lines.append(f"\\label{{tab:{args.prefix}-downstream}}".replace("_", "-"))
+            lines.append("\\end{table*}")
+            tex_path.write_text("\n".join(lines) + "\n")
+
+        def _write_correlation_tables() -> None:
+            """
+            Write correlation-preservation summary tables (Pearson/Spearman matrix similarity).
+            Focuses on anchor epsilons for compact reviewer-facing presentation.
+            """
+            pe = a_pear.rename(columns={"mean": "pearson_mean", "err_high": "pearson_err"}).copy()
+            sp = a_spear.rename(columns={"mean": "spearman_mean", "err_high": "spearman_err"}).copy()
+            keep = ["implementation", "epsilon"]
+            pe = pe[keep + ["pearson_mean", "pearson_err"]]
+            sp = sp[keep + ["spearman_mean", "spearman_err"]]
+            long = pe.merge(sp, on=keep, how="outer").sort_values(["epsilon", "implementation"])
+            long_csv = out_dir / f"{args.prefix}_correlation_long.csv"
+            long.to_csv(long_csv, index=False)
+
+            # Anchor epsilons (nearest available): 0.1, 1.0, 5.0
+            all_eps = sorted(pd.to_numeric(long["epsilon"], errors="coerce").dropna().unique().tolist())
+            anchors = []
+            for t in [0.1, 1.0, 5.0]:
+                if not all_eps:
+                    break
+                anchors.append(min(all_eps, key=lambda x: abs(float(x) - t)))
+            # de-duplicate while preserving order
+            seen = set()
+            anchor_eps = [e for e in anchors if not (e in seen or seen.add(e))]
+
+            cols = ["epsilon"] + [f"{impl} (Pearson)" for impl in impls] + [f"{impl} (Spearman)" for impl in impls]
+            wide_rows = []
+            for e in anchor_eps:
+                row: dict[str, Any] = {"epsilon": e}
+                for impl in impls:
+                    sub = long[(long["implementation"] == impl) & (pd.to_numeric(long["epsilon"], errors="coerce") == e)]
+                    if not sub.empty:
+                        r0 = sub.iloc[0]
+                        row[f"{impl} (Pearson)"] = _fmt_cell(r0.get("pearson_mean"), r0.get("pearson_err"))
+                        row[f"{impl} (Spearman)"] = _fmt_cell(r0.get("spearman_mean"), r0.get("spearman_err"))
+                    else:
+                        row[f"{impl} (Pearson)"] = ""
+                        row[f"{impl} (Spearman)"] = ""
+                wide_rows.append(row)
+
+            wide = pd.DataFrame(wide_rows, columns=cols)
+            wide_csv = out_dir / f"{args.prefix}_correlation_anchor_wide.csv"
+            wide.to_csv(wide_csv, index=False)
+
+            tex_path = out_dir / f"{args.prefix}_correlation_anchor_table.tex"
+            tex_cols = "l" + ("c" * (len(cols) - 1))
+            header = " & ".join([_escape_tex(c) for c in cols]) + " \\\\"
+            lines = []
+            lines.append("% Auto-generated by plot_utility_privacy_from_json.py --tables")
+            lines.append("\\begin{table*}[t]")
+            lines.append("\\centering")
+            lines.append("\\scriptsize")
+            lines.append("\\setlength{\\tabcolsep}{3pt}")
+            lines.append("\\resizebox{\\linewidth}{!}{%")
+            lines.append(f"\\begin{{tabular}}{{{tex_cols}}}")
+            lines.append("\\toprule")
+            lines.append(header)
+            lines.append("\\midrule")
+            for _, r in wide.iterrows():
+                vals = [r.get("epsilon")]
+                try:
+                    vals[0] = f"{float(vals[0]):g}"
+                except Exception:
+                    vals[0] = str(vals[0])
+                for c in cols[1:]:
+                    vals.append(str(r.get(c) or ""))
+                lines.append(" & ".join([_escape_tex(v) for v in vals]) + " \\\\")
+            lines.append("\\bottomrule")
+            lines.append("\\end{tabular}%")
+            lines.append("}")
+            lines.append("\\caption{Correlation preservation matrix similarity at anchor $\\varepsilon$ values (mean and uncertainty).}")
+            lines.append(f"\\label{{tab:{args.prefix}-correlation-anchor}}".replace("_", "-"))
+            lines.append("\\end{table*}")
+            tex_path.write_text("\n".join(lines) + "\n")
+
         # -----------------------------
         # Utility / fidelity figure
         # -----------------------------
@@ -484,7 +744,8 @@ def main() -> None:
         # (a) Weighted Jaccard, or (numeric-first) normalized Wasserstein/EMD
         ax = axes[0, 0]
         if numeric_first_effective and (a_wass["mean"].notna().any() or a_emd["mean"].notna().any()):
-            use = a_wass if a_wass["mean"].notna().any() else a_emd
+            # Prefer the candidate with wider coverage across implementations.
+            use = a_wass if _coverage_count(a_wass, impls) >= _coverage_count(a_emd, impls) else a_emd
             for impl in impls:
                 d = use[use["implementation"] == impl].sort_values("epsilon")
                 _plot_line(
@@ -502,6 +763,8 @@ def main() -> None:
             ax.set_xlabel("Privacy Budget (ε)")
             ax.set_ylabel("Norm. Wasserstein/EMD (↓)")
             ax.set_title("Numeric Fidelity (Wasserstein/EMD) vs ε (Lower is Better)", fontweight="bold")
+            _annotate_missing_lines(ax, use, impls)
+            _annotate_overlapping_lines(ax, use, impls)
         else:
             for impl in impls:
                 d = a_weighted_jaccard[a_weighted_jaccard["implementation"] == impl].sort_values("epsilon")
@@ -520,6 +783,8 @@ def main() -> None:
             ax.set_xlabel("Privacy Budget (ε)")
             ax.set_ylabel("Weighted Jaccard (↑)")
             ax.set_title("Weighted Jaccard vs ε (Higher is Better)", fontweight="bold")
+            _annotate_missing_lines(ax, a_weighted_jaccard, impls)
+            _annotate_overlapping_lines(ax, a_weighted_jaccard, impls)
         ax.legend()
         ax.grid(True, alpha=0.3)
 
@@ -542,6 +807,8 @@ def main() -> None:
         ax.set_xlabel("Privacy Budget (ε)")
         ax.set_ylabel("Marginal error (↓)")
         ax.set_title("Marginal Error vs ε (Lower is Better)", fontweight="bold")
+        _annotate_missing_lines(ax, a_marginal_error, impls)
+        _annotate_overlapping_lines(ax, a_marginal_error, impls)
         ax.legend()
         ax.grid(True, alpha=0.3)
 
@@ -564,6 +831,8 @@ def main() -> None:
         ax.set_xlabel("Privacy Budget (ε)")
         ax.set_ylabel("MI preservation (↑)")
         ax.set_title("MI Preservation vs ε (Higher is Better)", fontweight="bold")
+        _annotate_missing_lines(ax, a_mi, impls)
+        _annotate_overlapping_lines(ax, a_mi, impls)
         ax.legend()
         ax.grid(True, alpha=0.3)
 
@@ -672,12 +941,18 @@ def main() -> None:
         ax.set_xlabel("Privacy Budget (ε)")
         ax.set_ylabel("KL divergence (↓)")
         ax.set_title("Coverage KL vs ε (Lower is Better)", fontweight="bold")
+        _annotate_missing_lines(ax, a_kl, impls)
+        _annotate_overlapping_lines(ax, a_kl, impls)
         ax.legend()
         ax.grid(True, alpha=0.3)
 
         # (g) Coverage: Jaccard coverage (↑), or (numeric-first) KS (↓), or MI-matrix rank correlation (↑)
         ax = axes[2, 0]
-        if numeric_first_effective and a_ks["mean"].notna().any():
+        # Prefer a metric that is available for most implementations.
+        # KS is used only when present for multiple mechanisms; otherwise we fall back to MI-matrix similarity.
+        cov_ks = _coverage_count(a_ks, impls)
+        cov_nmi = _coverage_count(a_nmi, impls)
+        if numeric_first_effective and cov_ks >= 3:
             for impl in impls:
                 d = a_ks[a_ks["implementation"] == impl].sort_values("epsilon")
                 _plot_line(
@@ -696,7 +971,9 @@ def main() -> None:
             ax.set_ylabel("KS statistic (↓)")
             ax.set_title("Numeric Fidelity (KS) vs ε (Lower is Better)", fontweight="bold")
             ax.set_ylim(0, 1)
-        elif numeric_first_effective and a_nmi["mean"].notna().any():
+            _annotate_missing_lines(ax, a_ks, impls)
+            _annotate_overlapping_lines(ax, a_ks, impls)
+        elif numeric_first_effective and cov_nmi > 0:
             for impl in impls:
                 d = a_nmi[a_nmi["implementation"] == impl].sort_values("epsilon")
                 _plot_line(
@@ -715,6 +992,8 @@ def main() -> None:
             ax.set_ylabel("Spearman ρ (↑)")
             ax.set_title("MI Matrix Similarity vs ε (Higher is Better)", fontweight="bold")
             ax.set_ylim(-1, 1)
+            _annotate_missing_lines(ax, a_nmi, impls)
+            _annotate_overlapping_lines(ax, a_nmi, impls)
         else:
             for impl in impls:
                 d = a_jaccard_cov[a_jaccard_cov["implementation"] == impl].sort_values("epsilon")
@@ -734,6 +1013,8 @@ def main() -> None:
             ax.set_ylabel("Jaccard coverage (↑)")
             ax.set_title("Coverage Jaccard vs ε (Higher is Better)", fontweight="bold")
             ax.set_ylim(0, 1)
+            _annotate_missing_lines(ax, a_jaccard_cov, impls)
+            _annotate_overlapping_lines(ax, a_jaccard_cov, impls)
         ax.legend()
         ax.grid(True, alpha=0.3)
 
@@ -778,6 +1059,8 @@ def main() -> None:
         ax.set_ylabel("AUC (Syn→Real) (↑)")
         ax.set_title("Downstream ML vs ε (Higher is Better)", fontweight="bold")
         ax.set_ylim(0, 1)
+        _annotate_missing_lines(ax, a_lr, impls, loc=(0.02, 0.02))
+        _annotate_missing_lines(ax, a_rf, impls, loc=(0.02, 0.06))
         ax.legend(ncol=2, fontsize=9)
         ax.grid(True, alpha=0.3)
 
@@ -800,6 +1083,8 @@ def main() -> None:
         ax.set_xlabel("Privacy Budget (ε)")
         ax.set_ylabel("Utility per ε (↑)")
         ax.set_title("Utility/ε vs ε (Higher is Better)", fontweight="bold")
+        _annotate_missing_lines(ax, a_eff, impls)
+        _annotate_overlapping_lines(ax, a_eff, impls)
         ax.legend()
         ax.grid(True, alpha=0.3)
 
@@ -810,6 +1095,10 @@ def main() -> None:
         fig.savefig(util_png, dpi=300, bbox_inches="tight")
         fig.savefig(util_pdf, bbox_inches="tight")
         plt.close(fig)
+
+        if args.tables:
+            _write_downstream_tables()
+            _write_correlation_tables()
 
         # -----------------------------
         # Privacy figure
@@ -960,6 +1249,31 @@ def main() -> None:
                 drew = True
         if drew:
             _annotate_zero_lines(ax, a_audit_mia_auc, impls, loc=(0.02, 0.08))
+            # If all curves overlap (common when AUC=0.5 for all), add an explicit note.
+            try:
+                sub = a_audit_mia_auc[a_audit_mia_auc["implementation"].isin(impls)].copy()
+                sub = sub.dropna(subset=["epsilon", "mean"])
+                if not sub.empty:
+                    piv = sub.pivot_table(
+                        index="epsilon", columns="implementation", values="mean", aggfunc="first"
+                    )
+                    if piv.shape[1] >= 2:
+                        # Max spread across implementations, worst epsilon.
+                        spread = (piv.max(axis=1) - piv.min(axis=1)).max()
+                        if pd.notna(spread) and float(spread) < 1e-6:
+                            v = float(piv.stack().iloc[0])
+                            ax.text(
+                                0.02,
+                                0.92,
+                                f"All implementations overlap at AUC={v:.3f} across ε",
+                                ha="left",
+                                va="top",
+                                transform=ax.transAxes,
+                                fontsize=10,
+                                bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8, edgecolor="none"),
+                            )
+            except Exception:
+                pass
         ax.set_xlabel("Privacy Budget (ε)")
         ax.set_ylabel("MIA AUC (↓)")
         ax.set_title("Membership Inference (AUC) vs ε (Lower is Better)", fontweight="bold")

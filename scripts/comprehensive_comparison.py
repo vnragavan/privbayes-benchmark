@@ -306,6 +306,10 @@ class ImplementationResult:
     correlation_metrics: Optional[Dict] = None
     coverage_metrics: Optional[Dict] = None
     downstream_metrics: Optional[Dict] = None
+
+    # Utility - Numeric fidelity (optional; numeric-first datasets)
+    numeric_ks_mean: Optional[float] = None
+    numeric_wasserstein_mean: Optional[float] = None
     
     # Privacy Attacks
     exact_row_match_rate: Optional[float] = None
@@ -406,6 +410,7 @@ def run_dpmm_privbayes(
     preprocess: str = "none",
     public_bounds: Optional[dict] = None,
     public_categories: Optional[dict] = None,
+    column_types: Optional[dict] = None,
 ) -> ImplementationResult:
     """Run DPMM PrivBayes implementation and measure performance.
     
@@ -430,8 +435,12 @@ def run_dpmm_privbayes(
 
         pb = dict(public_bounds or {})
         pc = dict(public_categories or {})
-        if strict_dp and dataset_tag == "adult" and not pc:
-            pc = dict(_ADULT_PUBLIC_CATEGORIES)
+        if strict_dp and dataset_tag == "adult":
+            # In strict-DP, Adult has well-known public domains for many categoricals.
+            # Merge them with any schema-provided domains (e.g., ordinal discrete columns like education-num).
+            merged = dict(_ADULT_PUBLIC_CATEGORIES)
+            merged.update(pc)
+            pc = merged
 
         # Ensure label domain is treated as categorical for DPMM too.
         # Without this, binary labels like breast-cancer "target" get treated as numeric,
@@ -461,6 +470,7 @@ def run_dpmm_privbayes(
             strict_dp=bool(strict_dp),
             public_bounds=pb if pb else None,
             public_categories=pc if pc else None,
+            column_types=dict(column_types or {}),
             int_cardinality_as_categorical=20,
             n_jobs=1,
             compress=True,
@@ -574,9 +584,11 @@ def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
             if pub is not None:
                 public_categories[detected_target_col] = pub
             elif strict_dp:
-                raise RuntimeError(
-                    f"strict-dp enabled: unknown public label domain for target_col='{detected_target_col}'."
-                )
+                if detected_target_col not in public_categories or not public_categories[detected_target_col]:
+                    raise RuntimeError(
+                        f"strict-dp enabled: unknown public label domain for target_col='{detected_target_col}'."
+                        " Provide it in the schema (public_categories) or use a known target (income, target)."
+                    )
             else:
                 # Legacy (non-DP): infer label domain from data
                 unique_labels = sorted(real[detected_target_col].astype(str).dropna().unique().tolist())
@@ -651,6 +663,57 @@ def run_enhanced_privbayes(real: pd.DataFrame, epsilon: float, seed: int,
 
 # ==================== UTILITY METRICS ====================
 
+def compute_numeric_fidelity_metrics(
+    real: pd.DataFrame, syn: pd.DataFrame, *, target_col: Optional[str] = None
+) -> dict[str, float]:
+    """
+    Numeric-fidelity metrics for numeric-first datasets.
+
+    Returns:
+      - numeric_ks_mean: mean two-sample KS statistic across numeric columns (lower is better)
+      - numeric_wasserstein_mean: mean normalized 1D Wasserstein distance across numeric columns
+        (normalized by REAL IQR; lower is better)
+    """
+    num_cols = [c for c in real.columns if pd.api.types.is_numeric_dtype(real[c])]
+    if target_col is not None and target_col in num_cols:
+        num_cols = [c for c in num_cols if c != target_col]
+
+    ks_vals: list[float] = []
+    w_vals: list[float] = []
+    for c in num_cols:
+        xr = pd.to_numeric(real[c], errors="coerce").to_numpy(dtype=float)
+        xs = pd.to_numeric(syn[c], errors="coerce").to_numpy(dtype=float)
+        xr = xr[np.isfinite(xr)]
+        xs = xs[np.isfinite(xs)]
+        if xr.size == 0 or xs.size == 0:
+            continue
+
+        # KS statistic
+        try:
+            ks = float(stats.ks_2samp(xr, xs).statistic)
+            if np.isfinite(ks):
+                ks_vals.append(ks)
+        except Exception:
+            pass
+
+        # Normalized Wasserstein distance (normalize by REAL IQR)
+        try:
+            q25, q75 = np.percentile(xr, [25.0, 75.0])
+            iqr = float(q75 - q25)
+            denom = iqr if np.isfinite(iqr) and iqr > 1e-12 else float(np.std(xr) if np.std(xr) > 1e-12 else 1.0)
+            w = float(stats.wasserstein_distance(xr, xs) / denom)
+            if np.isfinite(w):
+                w_vals.append(w)
+        except Exception:
+            pass
+
+    out: dict[str, float] = {
+        "numeric_ks_mean": float(np.mean(ks_vals)) if ks_vals else float("nan"),
+        "numeric_wasserstein_mean": float(np.mean(w_vals)) if w_vals else float("nan"),
+    }
+    return out
+
+
 def compute_basic_utility(real: pd.DataFrame, syn: pd.DataFrame) -> Dict[str, float]:
     """Compute basic utility metrics: Jaccard, weighted Jaccard, marginal error.
     
@@ -690,11 +753,38 @@ def compute_basic_utility(real: pd.DataFrame, syn: pd.DataFrame) -> Dict[str, fl
     errors = []
     for col in real.columns:
         if pd.api.types.is_numeric_dtype(real[col]):
-            # Numeric: histogram comparison
-            bins = np.histogram_bin_edges(real[col].dropna(), bins=20)
-            hist_real, _ = np.histogram(real[col].dropna(), bins=bins, density=True)
-            hist_syn, _ = np.histogram(syn[col].dropna(), bins=bins, density=True)
-            errors.append(np.abs(hist_real - hist_syn).mean())
+            # Numeric: histogram comparison on fixed REAL bin edges.
+            # Use counts (not density=True) to avoid NaNs when SYN has no finite values.
+            xr = pd.to_numeric(real[col], errors="coerce").to_numpy(dtype=float)
+            xs = pd.to_numeric(syn[col], errors="coerce").to_numpy(dtype=float)
+            xr = xr[np.isfinite(xr)]
+            xs = xs[np.isfinite(xs)]
+            if xr.size == 0:
+                continue
+            # Robust bin edges; ensure at least 2 bins.
+            try:
+                bins = np.histogram_bin_edges(xr, bins=20)
+                if not (isinstance(bins, np.ndarray) and bins.size >= 2):
+                    raise ValueError("bad bins")
+                if np.allclose(bins[0], bins[-1]):
+                    # constant column: treat as 0 error if syn is also constant at same value, else 1
+                    err = 0.0 if (xs.size > 0 and np.allclose(np.nanmean(xs), float(bins[0]), atol=1e-9)) else 1.0
+                    errors.append(float(err))
+                    continue
+            except Exception:
+                vmin = float(np.nanmin(xr))
+                vmax = float(np.nanmax(xr))
+                if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                    continue
+                bins = np.linspace(vmin, vmax, 21)
+
+            cr, _ = np.histogram(xr, bins=bins, density=False)
+            cs, _ = np.histogram(xs if xs.size > 0 else np.array([], dtype=float), bins=bins, density=False)
+            pr = (cr.astype(float) + 1e-12)
+            ps = (cs.astype(float) + 1e-12)
+            pr = pr / pr.sum()
+            ps = ps / ps.sum()
+            errors.append(float(np.abs(pr - ps).sum() / 2.0))  # TV distance in 1D histogram
         else:
             # Categorical: frequency comparison
             real_dist = real[col].value_counts(normalize=True)
@@ -703,7 +793,7 @@ def compute_basic_utility(real: pd.DataFrame, syn: pd.DataFrame) -> Dict[str, fl
             error = sum(abs(real_dist.get(c, 0) - syn_dist.get(c, 0)) for c in all_cats) / 2
             errors.append(error)
     
-    metrics['marginal_error'] = np.mean(errors) if errors else float('nan')
+    metrics['marginal_error'] = float(np.mean(errors)) if errors else float("nan")
     
     return metrics
 
@@ -1311,12 +1401,15 @@ def main(
     public_schema = _load_public_schema(schema)
     public_bounds_schema = public_schema.get("public_bounds") if isinstance(public_schema, dict) else None
     public_categories_schema = public_schema.get("public_categories") if isinstance(public_schema, dict) else None
+    public_column_types_schema = public_schema.get("column_types") if isinstance(public_schema, dict) else None
     if schema:
         print(f"Public schema: {schema}")
         if isinstance(public_bounds_schema, dict):
             print(f"  - public_bounds: {len(public_bounds_schema)} entries")
         if isinstance(public_categories_schema, dict):
             print(f"  - public_categories: {len(public_categories_schema)} columns")
+        if isinstance(public_column_types_schema, dict):
+            print(f"  - column_types: {len(public_column_types_schema)} columns")
     
     print(f"\n📁 Creating output directory: {out_dir}")
     os.makedirs(out_dir, exist_ok=True)
@@ -1378,8 +1471,11 @@ def main(
                             target_col=target_col,
                             regime=regime,
                             preprocess=dpmm_default_preprocess,
-                            public_bounds=(public_bounds_schema if (not strict_dp) else None),
-                            public_categories=(public_categories_schema if (not strict_dp) else None),
+                            # Public schema is public side information in BOTH regimes.
+                            # In strict-DP, passing public domains/bounds avoids accidental "unknown domain" failures.
+                            public_bounds=public_bounds_schema,
+                            public_categories=public_categories_schema,
+                            column_types=public_column_types_schema,
                         )
                     elif impl_name == "Enhanced":
                         result, syn, eval_real = run_enhanced_privbayes(
@@ -1435,6 +1531,15 @@ def main(
                     result.correlation_metrics = comp_util.get('correlation', {})
                     result.coverage_metrics = comp_util.get('coverage', {})
                     result.downstream_metrics = comp_util.get('downstream', {})
+
+                    # Numeric fidelity (KS/Wasserstein) for numeric-first datasets.
+                    try:
+                        nf = compute_numeric_fidelity_metrics(eval_real, syn, target_col=detected_target_col)
+                        result.numeric_ks_mean = nf.get("numeric_ks_mean")
+                        result.numeric_wasserstein_mean = nf.get("numeric_wasserstein_mean")
+                    except Exception:
+                        result.numeric_ks_mean = float("nan")
+                        result.numeric_wasserstein_mean = float("nan")
 
                     print(f"  Computing privacy attacks...")
                     privacy_attacks = compute_privacy_attacks(eval_real, syn)
@@ -1498,6 +1603,9 @@ def main(
                                         target_col=target_col,
                                         regime=regime,
                                         preprocess=dpmm_default_preprocess,
+                                        public_bounds=public_bounds_schema,
+                                        public_categories=public_categories_schema,
+                                        column_types=public_column_types_schema,
                                     )
                             except Exception as e:
                                 if result.audit_metrics is None:
